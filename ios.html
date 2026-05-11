@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{
+  margin:0;
+  height:100vh;
+  overflow:hidden;
+  font-family:sans-serif;
+  background:url('wallpaper.avif') center/cover no-repeat fixed;
+}
+
+video{
+  position:fixed;
+  inset:0;
+  width:100vw;
+  height:100vh;
+  object-fit:cover;
+}
+
+.card{
+  position:fixed;
+  inset:0;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  text-align:center;
+  color:#fff;
+  background:rgba(0,0,0,.35);
+  backdrop-filter:blur(10px);
+}
+
+.card div{
+  padding:20px;
+  border:1px solid rgba(255,255,255,.2);
+  border-radius:20px;
+  background:rgba(255,255,255,.08);
+}
+</style>
+</head>
+
+<body>
+
+<video id="v" autoplay playsinline muted>
+  <source src="ios.mp4" type="video/mp4">
+</video>
+
+<div class="card" id="c">
+  <div>
+    <h2>Listo ya está</h2>
+    <p>Cierra la página</p>
+  </div>
+</div>
+
+<script>
+const v=document.getElementById('v');
+const c=document.getElementById('c');
+
+v.play().catch(()=>{
+  c.style.display='flex';
+});
+</script>
+
+</body>
+</html>

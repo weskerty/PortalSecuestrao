@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0b0b">
+<title>CheAgana WiFi</title>
+
+<style>
+@font-face{
+  font-family:'Comfortaa';
+  src:url('font.woff2') format('woff2');
+  font-display:swap;
+}
+
+*{
+  margin:0;
+  padding:0;
+  box-sizing:border-box
+}
+
+:root{
+  --fg:#fff;
+  --tx:rgba(255,255,255,.72);
+  --bd:rgba(255,255,255,.18);
+  --bg:rgba(255,255,255,.1);
+  --bg2:rgba(255,255,255,.06);
+  --sh:0 20px 60px rgba(0,0,0,.45);
+  --ac:#9fffd4;
+}
+
+body{
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
+  overflow:hidden;
+  font-family:'Comfortaa',sans-serif;
+  color:var(--fg);
+  background:url('wallpaper.avif') center/cover no-repeat fixed;
+}
+
+body::before{
+  content:'';
+  position:fixed;
+  inset:0;
+  background:
+  radial-gradient(circle at top,rgba(255,255,255,.12),transparent 40%),
+  rgba(0,0,0,.38);
+  backdrop-filter:blur(3px);
+}
+
+.card{
+  position:relative;
+  z-index:2;
+  width:100%;
+  max-width:370px;
+  padding:34px 24px 24px;
+  border-radius:34px;
+  background:linear-gradient(
+    145deg,
+    rgba(255,255,255,.16),
+    rgba(255,255,255,.06)
+  );
+  border:1px solid var(--bd);
+  backdrop-filter:blur(26px) saturate(180%);
+  -webkit-backdrop-filter:blur(26px) saturate(180%);
+  box-shadow:var(--sh);
+}
+
+.top{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  text-align:center;
+  margin-top:-18px;
+}
+
+
+
+.top img{
+  width:99px;
+  margin-bottom:10px;
+}
+
+h1{
+  font-size:1.2rem;
+  letter-spacing:.05em;
+  margin-bottom:14px;
+}
+
+h4{
+  font-size:.82rem;
+  line-height:1.7;
+  color:var(--tx);
+  font-weight:400;
+  margin-bottom:22px;
+}
+
+.social{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:14px;
+  width:100%;
+  margin-bottom:18px;
+}
+
+.social a{
+  position:relative;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  height:58px;
+  border-radius:18px;
+  overflow:hidden;
+  text-decoration:none;
+  color:#fff;
+  background:rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.14);
+  backdrop-filter:blur(16px);
+  -webkit-backdrop-filter:blur(16px);
+  transition:.2s;
+}
+
+.social a::before{
+  content:'';
+  position:absolute;
+  inset:0;
+  background:linear-gradient(
+    135deg,
+    rgba(255,255,255,.18),
+    transparent,
+    rgba(255,255,255,.08)
+  );
+}
+
+.social a:hover{
+  transform:translateY(-2px) scale(1.02);
+  background:rgba(255,255,255,.12);
+}
+
+.social img{
+  height:24px;
+  width:24px;
+  object-fit:contain;
+  position:relative;
+  z-index:1;
+}
+
+.social span{
+  position:relative;
+  z-index:1;
+  font-size:.8rem;
+}
+
+.tos{
+  width:100%;
+  text-align:center;
+  font-size:.72rem;
+  color:rgba(255,255,255,.7);
+  padding:14px;
+  border-radius:18px;
+  margin-bottom:20px;
+  background:rgba(255,255,255,.06);
+  border:1px solid rgba(255,255,255,.08);
+}
+
+button{
+  width:100%;
+  height:58px;
+  border:none;
+  border-radius:20px;
+  cursor:pointer;
+  font-size:.9rem;
+  letter-spacing:.08em;
+  font-weight:700;
+  color:#062014;
+  font-family:'Comfortaa',sans-serif;
+  background:linear-gradient(135deg,#b8ffe2,#8fffcf);
+  box-shadow:
+  0 10px 30px rgba(143,255,207,.22),
+  inset 0 1px 0 rgba(255,255,255,.6);
+  transition:.18s;
+}
+
+button:hover{
+  transform:translateY(-1px);
+}
+
+button:disabled{
+  opacity:.55;
+  cursor:default;
+  transform:none;
+}
+
+.status{
+  min-height:18px;
+  text-align:center;
+  margin-top:14px;
+  font-size:.72rem;
+}
+
+.status.ok{
+  color:var(--ac);
+}
+
+.status.err{
+  color:#ff7f98;
+}
+
+.popup-overlay{
+  position:fixed;
+  inset:0;
+  z-index:50;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  background:rgba(0,0,0,.28);
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+}
+
+.popup-overlay.show{
+  display:flex;
+}
+
+.popup{
+  width:90%;
+  max-width:320px;
+  padding:30px 24px;
+  border-radius:32px;
+  text-align:center;
+  background:linear-gradient(
+    145deg,
+    rgba(255,255,255,.16),
+    rgba(255,255,255,.06)
+  );
+  border:1px solid rgba(255,255,255,.16);
+  backdrop-filter:blur(30px) saturate(180%);
+  -webkit-backdrop-filter:blur(30px) saturate(180%);
+  box-shadow:0 25px 70px rgba(0,0,0,.45);
+}
+
+.popup img{
+  width:92px;
+  margin-bottom:12px;
+  filter:drop-shadow(0 10px 18px rgba(0,0,0,.28));
+}
+
+.popup h2{
+  font-size:1rem;
+  letter-spacing:.08em;
+  margin-bottom:10px;
+  color:var(--ac);
+}
+
+.popup p{
+  font-size:.78rem;
+  line-height:1.7;
+  color:rgba(255,255,255,.78);
+  margin-bottom:18px;
+}
+
+.popup-bar{
+  width:100%;
+  height:4px;
+  overflow:hidden;
+  border-radius:99px;
+  background:rgba(255,255,255,.08);
+}
+
+.popup-bar-fill{
+  width:100%;
+  height:100%;
+  border-radius:99px;
+  background:linear-gradient(90deg,#b8ffe2,#8fffcf);
+  transition:width linear;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+
+  <div class="top">
+    <img src="saludo.avif">
+
+    <h1>Che Agana WiFi</h1>
+
+    <h4>
+      Hola Amigo 👋 Te Comparto mi WiFi<br>
+      Al tocar "Conectar" WhatsApp Funcionara.<br>
+      Pero a Cambio me gustaria que visites mi pagina 🥺
+      Cuando puedas Busca "Che Agana" en Redes Sociales ❤️
+    </h4>
+
+
+    <div class="tos">
+      Opcional, Cuando puedas nomás ✨
+    </div>
+
+  </div>
+
+  <button id="btn" onclick="authorize()">CONECTAR</button>
+
+  <div class="status" id="st"></div>
+
+</div>
+
+<div class="popup-overlay" id="popup">
+
+  <div class="popup">
+
+    <img src="abrazo.avif">
+
+    <h2>YA ESTÁS CONECTADO</h2>
+
+    <p>
+      Ya puedes usar WhatsApp ❤️<br>
+      Nos Vemos 👋 <span id="ct">4</span>...
+    </p>
+
+    <div class="popup-bar">
+      <div class="popup-bar-fill" id="pbar"></div>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+async function authorize(){
+  const A=document.getElementById('btn');
+  const B=document.getElementById('st');
+
+  A.disabled=true;
+  B.className='status';
+  B.textContent='Conectando...';
+
+  try{
+    const C=await fetch('/auth',{method:'POST'});
+    const D=await C.json();
+
+    if(D.ok){
+      B.className='status ok';
+      showPopup();
+    }else{
+      throw 0;
+    }
+
+  }catch{
+    B.className='status err';
+    B.textContent='Perdon, algo fallo 😿';
+    A.disabled=false;
+  }
+}
+
+function showPopup(){
+  const A=document.getElementById('popup');
+  const B=document.getElementById('ct');
+  const C=document.getElementById('pbar');
+
+  A.classList.add('show');
+
+  const D=4000;
+
+  C.style.transition='width '+D+'ms linear';
+
+  requestAnimationFrame(()=>{
+    requestAnimationFrame(()=>{
+      C.style.width='0%';
+    });
+  });
+
+  let E=4;
+
+  const F=setInterval(()=>{
+    E--;
+    B.textContent=E;
+
+    if(E<=0){
+  clearInterval(F);
+  location.href='ios.html';
+}
+
+  },1000);
+}
+</script>
+
+</body>
+</html>
