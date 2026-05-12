@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{height:100vh;overflow:hidden;background:url('wallpaper.avif') center/cover no-repeat #000;font-family:sans-serif}
+
+#v{
+  position:fixed;
+  inset:0;
+  width:100vw;
+  height:100vh;
+  object-fit:cover;
+}
+
+#snd{
+  position:fixed;
+  bottom:32px;
+  left:50%;
+  transform:translateX(-50%);
+  z-index:10;
+  display:none;
+  padding:12px 28px;
+  border-radius:99px;
+  border:1px solid rgba(255,255,255,.3);
+  background:rgba(0,0,0,.55);
+  color:#fff;
+  font-size:.88rem;
+  backdrop-filter:blur(14px);
+  -webkit-backdrop-filter:blur(14px);
+  cursor:pointer;
+  white-space:nowrap;
+}
+
+#c{
+  position:fixed;
+  inset:0;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  color:#fff;
+  background:rgba(0,0,0,.45);
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+  z-index:20;
+}
+
+#c div{
+  padding:24px 32px;
+  border:1px solid rgba(255,255,255,.2);
+  border-radius:20px;
+  background:rgba(255,255,255,.08);
+  text-align:center;
+}
+</style>
+</head>
+<body>
+
+<video id="v" playsinline loop>
+  <source src="explicacion.mp4" type="video/mp4">
+</video>
+
+<button id="snd">🔊 Activar sonido</button>
+
+<div id="c">
+  <div>
+    <h2>Video Explicativo</h2>
+    <p>Sobre que es Esto</p>
+  </div>
+</div>
+
+<script>
+const v   = document.getElementById('v');
+const c   = document.getElementById('c');
+const snd = document.getElementById('snd');
+
+function tryFS() {
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen;
+  if (req) req.call(el).catch(() => {});
+  else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();
+}
+
+snd.addEventListener('click', () => {
+  v.muted = false;
+  v.play().catch(() => {});
+  tryFS();
+  snd.style.display = 'none';
+});
+
+v.muted = false;
+v.play()
+  .then(() => tryFS())
+  .catch(() => {
+    v.muted = true;
+    v.play()
+      .then(() => { snd.style.display = 'block'; })
+      .catch(() => { c.style.display = 'flex'; });
+  });
+</script>
+</body>
+</html>
