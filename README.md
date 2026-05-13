@@ -10,9 +10,11 @@ Claramente Requiere ROOT y el Anclaje ya debe estar activo desde antes, se puede
 
 ## Instalar
 Abre Termux y Pegalo, se iniciara automaticamente al terminar. Recuerda tener tu Anclaje/Hotspot activado antes de ejecutar.
-ˋˋˋ
 
-ˋˋˋ
+```
+curl -fsSL https://raw.githubusercontent.com/weskerty/TermuxGod/main/Scripts/AutoScripts/PortalCautivo.sh | bash
+
+```
 
 Para auto inicio debes editar tu .bashrc o utilizar [Tasker ↗️](https://play.google.com/store/apps/details?id=net.dinglisch.android.taskerm), [Termux Boot ↗️](https://wiki.termux.com/wiki/Termux:Boot) o como gustes autoiniciar.
 
