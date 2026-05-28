@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const dnsP = require('dns').promises;
 
 function loadEnv() {
   const p = path.join(__dirname, '.env');
@@ -17,20 +18,25 @@ function loadEnv() {
 }
 loadEnv();
 
-const PORT       = parseInt(process.env.PORT)     || 8080;
-const DNS_PORT   = parseInt(process.env.DNS_PORT) || 5454;
-const IFACE_IN   = process.env.IFACE_IN           || 'wlan2';
-const OPEN_MS    = parseInt(process.env.OPEN_MS)  || 7000;
-const LOG_MAX    = parseInt(process.env.LOG_MAX)  || 500;
-const CLEAN_MS   = parseInt(process.env.CLEAN_MS) || 3600000;
-const WA_RANGES  = (process.env.WA_RANGES || '31.13.64.0/18,157.240.0.0/16,179.60.192.0/22').split(',').map(s => s.trim());
-const CONN_HOSTS = (process.env.CONNECTIVITY_DOMAINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const FREE_MACS  = new Set((process.env.FREE_MACS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+const PORT        = parseInt(process.env.PORT)     || 8080;
+const DNS_PORT    = parseInt(process.env.DNS_PORT) || 5454;
+const IFACE_IN    = process.env.IFACE_IN           || 'wlan2';
+const OPEN_MS     = parseInt(process.env.OPEN_MS)  || 7000;
+const LOG_MAX     = parseInt(process.env.LOG_MAX)  || 500;
+const CLEAN_MS    = parseInt(process.env.CLEAN_MS) || 3600000;
+const WA_RANGES   = (process.env.WA_RANGES || '31.13.64.0/18,157.240.0.0/16,179.60.192.0/22').split(',').map(s => s.trim());
+const CONN_HOSTS  = (process.env.CONNECTIVITY_DOMAINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const FREE_MACS   = new Set((process.env.FREE_MACS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+const YESDOM_RAW  = (process.env.YESDOM || '').split(',').map(s => s.trim()).filter(Boolean);
+const SPEED       = parseInt(process.env.SPEED) || 0;
+const TERMUX_SH   = '/data/data/com.termux/files/usr/bin/bash';
 const ADMIN_USERS = {};
 (process.env.ADMIN_USERS || 'admin:1234').split(',').forEach(e => {
   const [u, ...rest] = e.split(':');
   if (u && rest.length) ADMIN_USERS[u.trim()] = rest.join(':').trim();
 });
+
+let ALLOW_RANGES = WA_RANGES;
 
 function T() { return new Date().toTimeString().slice(0, 8); }
 const L = {
@@ -118,6 +124,55 @@ function getGatewayIP() {
 const GW = getGatewayIP();
 const PORTAL_URL = `http://${GW}:${PORT}/`;
 
+const markFree = [];
+let markCtr = 1;
+const markMap = new Map();
+
+function allocMark() { return markFree.length ? markFree.pop() : markCtr++; }
+function freeMark(m) { markFree.push(m); }
+function tcCmd(s) { run(`su -c "tc ${s}"`); }
+
+async function initTc() {
+  if (!SPEED) return;
+  tcCmd(`qdisc del dev ${IFACE_IN} root 2>/dev/null`);
+  tcCmd(`qdisc add dev ${IFACE_IN} root handle 1: htb default 999`);
+  tcCmd(`class add dev ${IFACE_IN} parent 1: classid 1:999 htb rate 1000mbit`);
+  L.info(`TC SPEED=${SPEED}kb/s on ${IFACE_IN}`);
+}
+
+async function tcAuth(mac, ip) {
+  if (!SPEED || FREE_MACS.has(mac) || markMap.has(mac)) return;
+  const m = allocMark();
+  markMap.set(mac, { m, ip });
+  tcCmd(`class add dev ${IFACE_IN} parent 1: classid 1:${m} htb rate ${SPEED}kbit burst ${Math.max(SPEED, 32)}k`);
+  tcCmd(`filter add dev ${IFACE_IN} parent 1: protocol ip handle ${m} fw flowid 1:${m}`);
+  await ipt(`-t mangle -A FORWARD -d ${ip} -j MARK --set-mark ${m}`);
+}
+
+async function tcDeauth(mac) {
+  if (!SPEED) return;
+  const e = markMap.get(mac);
+  if (!e) return;
+  markMap.delete(mac);
+  freeMark(e.m);
+  await ipt(`-t mangle -D FORWARD -d ${e.ip} -j MARK --set-mark ${e.m}`);
+  tcCmd(`filter del dev ${IFACE_IN} parent 1: protocol ip handle ${e.m} fw`);
+  tcCmd(`class del dev ${IFACE_IN} parent 1: classid 1:${e.m}`);
+}
+
+async function resolveYesdom() {
+  if (!YESDOM_RAW.length) return;
+  const ips = new Set();
+  for (const d of YESDOM_RAW) {
+    try {
+      const addrs = await dnsP.resolve4(d);
+      addrs.forEach(ip => ips.add(ip + '/32'));
+      L.ok(`YESDOM ${d} -> ${addrs.join(',')}`);
+    } catch (_) { L.warn(`YESDOM fail ${d}`); }
+  }
+  if (ips.size) ALLOW_RANGES = [...ips];
+}
+
 async function initRules() {
   L.info(`initRules GW=${GW} IFACE=${IFACE_IN} PORT=${PORT} DNS=${DNS_PORT}`);
   run(`su -c "iptables -t nat -N PORTAL_PRE 2>/dev/null"`);
@@ -129,7 +184,7 @@ async function initRules() {
   await ipt(`-t nat -A PORTAL_PRE -p tcp --dport 443 -j REDIRECT --to-port ${PORT}`);
   run(`su -c "iptables -N PORTAL_WA 2>/dev/null"`);
   await ipt(`-F PORTAL_WA`);
-  for (const r of WA_RANGES) await ipt(`-A PORTAL_WA -d ${r} -j ACCEPT`);
+  for (const r of ALLOW_RANGES) await ipt(`-A PORTAL_WA -d ${r} -j ACCEPT`);
   await ipt(`-A PORTAL_WA -m state --state RELATED,ESTABLISHED -j ACCEPT`);
   await ipt(`-A PORTAL_WA -j DROP`);
   run(`su -c "iptables -D INPUT -i ${IFACE_IN} -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null"`);
@@ -163,6 +218,7 @@ async function authMac(mac, ip) {
     await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 80 -j RETURN`);
     await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 443 -j RETURN`);
     await ipt(`-I FORWARD -i ${IFACE_IN} -m mac --mac-source ${mac} -j ACCEPT`);
+    await tcAuth(mac, ip);
     setTimeout(() => restrictMac(mac), OPEN_MS);
   }
   pushLog(mac, ip, 'auth', null);
@@ -171,6 +227,7 @@ async function authMac(mac, ip) {
 
 async function deauthMac(mac) {
   authed.delete(mac);
+  await tcDeauth(mac);
   await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p udp --dport 53 -j RETURN`);
   await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 80 -j RETURN`);
   await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 443 -j RETURN`);
@@ -195,6 +252,10 @@ function parseDnsName(buf) {
 
 function isConnHost(name) {
   return CONN_HOSTS.some(h => name === h || name.endsWith('.' + h));
+}
+
+function isYD(name) {
+  return YESDOM_RAW.some(d => name === d || name.endsWith('.' + d));
 }
 
 function dnsReply(reqBuf, ip) {
@@ -259,7 +320,7 @@ dnsServer.on('message', (msg, rinfo) => {
       pushLog(mac, rinfo.address, 'dns', name);
     }
   }
-  if (isConnHost(name)) forwardDns(msg, rinfo);
+  if (isConnHost(name) || isYD(name)) forwardDns(msg, rinfo);
   else {
     const reply = dnsReply(msg, GW);
     if (reply) dnsServer.send(reply, rinfo.port, rinfo.address);
@@ -380,7 +441,14 @@ wss.on('connection', (ws, req) => {
     if (!cmd) return;
     if (activeProc) { try { activeProc.kill(); } catch (_) {} }
     L.info(`CMD [${user}] ${cmd}`);
-    const proc = spawn('su', ['-c', cmd], { shell: false });
+    const proc = spawn(TERMUX_SH, ['-c', cmd], {
+      env: {
+        PATH: `/data/data/com.termux/files/usr/bin:${process.env.PATH || '/system/bin:/system/xbin'}`,
+        HOME: '/data/data/com.termux/files/home',
+        PREFIX: '/data/data/com.termux/files/usr',
+        TMPDIR: '/data/data/com.termux/files/usr/tmp',
+      }
+    });
     activeProc = proc;
     let out = '', err = '';
     proc.stdout.on('data', d => { out += d.toString(); });
@@ -444,7 +512,9 @@ app.post('/auth', async (req, res) => {
 });
 
 (async () => {
+  await resolveYesdom();
   await initRules();
+  await initTc();
   dnsServer.bind(DNS_PORT, '0.0.0.0', () => L.info(`DNS :${DNS_PORT}`));
   server.listen(PORT, '0.0.0.0', () => L.ok(`Portal :${PORT}`));
 })();
