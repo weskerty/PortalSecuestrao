@@ -1,0 +1,2 @@
+# x.sh corre en Termux/Linux: con CRLF el shebang falla con "bad interpreter"
+*.sh text eol=lf
