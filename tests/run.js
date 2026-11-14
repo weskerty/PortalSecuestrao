@@ -108,6 +108,11 @@ t('ADMIN_SHELL=1 lo enciende, ADMIN=0 lo fuerza apagado', () => {
   assert.strictEqual(cfg.buildConfig({ ADMIN: '0', ADMIN_SHELL: '1' }).adminShell, false);
 });
 
+t('OPEN_MS por defecto es 0 y coincide con el .env.example', () => {
+  assert.strictEqual(cfg.buildConfig({}).openMs, 0);
+  assert.strictEqual(cfg.buildConfig({ OPEN_MS: '7000' }).openMs, 7000);
+});
+
 group('.env: validacion de valores que llegan a un shell');
 
 t('IFACE_IN con comando inyectado es fatal', () => {
