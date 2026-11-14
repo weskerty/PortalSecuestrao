@@ -69,6 +69,16 @@ t('la prosa de los comentarios no cuenta como clave', () => {
   assert.strictEqual(have.size, 0, [...have].join(','));
 });
 
+t('comentar CONNECTIVITY_DOMAINS no rompe la deteccion de portal', () => {
+  const c = cfg.buildConfig({});
+  assert.ok(c.connDomains.includes('captive.apple.com'), c.connDomains.join(','));
+  assert.ok(c.connDomains.includes('connectivitycheck.gstatic.com'));
+});
+
+t('si se define, gana lo definido', () => {
+  assert.deepStrictEqual(cfg.buildConfig({ CONNECTIVITY_DOMAINS: 'solo.esto' }).connDomains, ['solo.esto']);
+});
+
 t('una clave que no aparece de ninguna forma si se detecta como nueva', () => {
   assert.strictEqual(cfg.mentionedKeys('PORT=8080').has('BLOCK_IPV6'), false);
 });
