@@ -1,6 +1,7 @@
-ios.mp4
-explicacion.mp4
-index.html
+# Copias de trabajo de cada instalacion: la plantilla versionada es
+# index.default.html y .env.example. Ver ensureSeed() en lib/config.js.
+public/index.html
+public/*.mp4
 
 
 
@@ -157,3 +158,7 @@ vite.config.ts.timestamp-*
 
 # Estado de ejecucion del aprendizaje por DNS
 .snoop.json
+.snoop.json.tmp
+
+# Copias que x.sh guarda mientras actualiza
+.keep_tmp/

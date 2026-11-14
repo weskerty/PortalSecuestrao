@@ -1,772 +1,379 @@
+'use strict';
+
 const express = require('express');
-const { execSync, exec, spawn } = require('child_process');
-const dgram = require('dgram');
+const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
-const http = require('http');
 const dnsMod = require('dns');
+const { spawn } = require('child_process');
+const { WebSocketServer } = require('ws');
 
-function loadEnv() {
-  const p = path.join(__dirname, '.env');
-  if (!fs.existsSync(p)) return;
-  fs.readFileSync(p, 'utf8').split('\n').forEach(l => {
-    const m = l.match(/^([^#=]+)=(.*)$/);
-    if (m) process.env[m[1].trim()] = m[2].trim();
-  });
+const C = require('./lib/config');
+const { hasRoot } = require('./lib/sh');
+const detectMod = require('./lib/detect');
+const { Firewall } = require('./lib/fw');
+const { Allowlist } = require('./lib/allowlist');
+const { DnsProxy, safeName } = require('./lib/dnsproxy');
+const { MacTable, MarkPool } = require('./lib/clients');
+
+const DIR = __dirname;
+const PUBLIC_DIR = path.join(DIR, 'public');
+const TERMUX_SH = '/data/data/com.termux/files/usr/bin/bash';
+
+/* ------------------------------------------------------------------- log --- */
+
+const COLOR = { info: 36, ok: 32, warn: 33, err: 31 };
+function stamp() { return new Date().toTimeString().slice(0, 8); }
+function L(level, msg) {
+  const c = COLOR[level] || 36;
+  console.log(`\x1b[${c}m[${stamp()}]\x1b[0m ${msg}`);
 }
-loadEnv();
+L.info = m => L('info', m);
+L.ok   = m => L('ok', m);
+L.warn = m => L('warn', m);
+L.err  = m => L('err', m);
 
-const PORT        = parseInt(process.env.PORT)     || 8080;
-const DNS_PORT    = parseInt(process.env.DNS_PORT) || 5454;
-const IFACE_IN    = process.env.IFACE_IN           || 'wlan2';
-const OPEN_MS     = parseInt(process.env.OPEN_MS)  || 7000;
-const LOG_MAX     = parseInt(process.env.LOG_MAX)  || 500;
-const CLEAN_MS    = parseInt(process.env.CLEAN_MS) || 3600000;
-const csv = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+/* ------------------------------------------------------------------ conf --- */
 
-// CIDRs permitidos de forma fija. WA_RANGES se mantiene como alias historico.
-const STATIC_RANGES = csv(process.env.ALLOW_RANGES || process.env.WA_RANGES);
-// Dominios permitidos: se resuelven al arrancar y se aprenden del trafico DNS
-// real. YESDOM se mantiene como alias historico.
-const ALLOW_DOMAINS = csv(process.env.ALLOW_DOMAINS || process.env.YESDOM)
-  .map(d => d.toLowerCase().replace(/^\.+/, ''));
-const CONN_HOSTS  = csv(process.env.CONNECTIVITY_DOMAINS);
-const FREE_MACS   = new Set(csv(process.env.FREE_MACS).map(s => s.toLowerCase()));
-const SPEED       = parseInt(process.env.SPEED) || 0;
+C.loadEnvFile(DIR, m => L.info(m));
+C.ensureSeed(path.join(PUBLIC_DIR, 'index.default.html'), path.join(PUBLIC_DIR, 'index.html'), m => L.info(m));
+const cfg = C.buildConfig(process.env);
 
-/* --- Aprendizaje por DNS -------------------------------------------------
- * Generico: no sabe nada de ningun servicio concreto. Observa las respuestas
- * DNS que pasan por este servidor y, cuando el nombre consultado pertenece a
- * ALLOW_DOMAINS, mete las IPs devueltas en la allowlist al vuelo.
- *
- * SNOOP_WIDEN resuelve el problema de los CDN con balanceo geografico: una IP
- * suelta (/32) se queda obsoleta en cuanto el proveedor rota de PoP, pero
- * ensanchar a ciegas es peligroso si el destino es infraestructura compartida
- * (p.ej. AWS Global Accelerator, donde un /24 arrastra miles de servicios
- * ajenos). Con SNOOP_WIDEN declaras en que redes es seguro agrupar y a que
- * prefijo; fuera de ellas se usa /32.
- *   Formato: <red>/<mascara>:<prefijo_destino>,...
- *   Ejemplo: 57.144.0.0/14:24  -> dentro de 57.144.0.0/14, agrupa a /24
- */
-const SNOOP            = (process.env.SNOOP || '1') !== '0' && ALLOW_DOMAINS.length > 0;
-const SNOOP_MAX        = parseInt(process.env.SNOOP_MAX) || 256;
-const SNOOP_REFRESH_MS = process.env.SNOOP_REFRESH_MS === undefined
-  ? 1800000 : (parseInt(process.env.SNOOP_REFRESH_MS) || 0);
-const SNOOP_CACHE      = process.env.SNOOP_CACHE === undefined
-  ? '.snoop.json' : process.env.SNOOP_CACHE.trim();
-const SNOOP_FORCE_DNS  = process.env.SNOOP_FORCE_DNS === '1';
-const SNOOP_WIDEN      = csv(process.env.SNOOP_WIDEN).map(spec => {
-  const m = spec.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+):(\d+)$/);
-  if (!m) return null;
-  const bits = parseInt(m[2]), to = parseInt(m[3]);
-  if (bits < 0 || bits > 32 || to < 8 || to > 32 || to < bits) return null;
-  return { base: ipToInt(m[1]) >>> 0, mask: bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0, to };
-}).filter(Boolean);
-const TERMUX_SH   = '/data/data/com.termux/files/usr/bin/bash';
-const ADMIN_USERS = {};
-(process.env.ADMIN_USERS || 'admin:1234').split(',').forEach(e => {
-  const [u, ...rest] = e.split(':');
-  if (u && rest.length) ADMIN_USERS[u.trim()] = rest.join(':').trim();
+for (const w of cfg.warn) L.warn(w);
+if (cfg.fatal.length) {
+  for (const f of cfg.fatal) L.err(f);
+  L.err('Revisa el .env. No se arranca con valores que acabarian dentro de un comando de root.');
+  process.exit(1);
+}
+
+/* Sin ADMIN_USERS el panel quedaba con admin:1234. Una clave aleatoria por
+ * arranque es util para entrar una vez y no deja una puerta conocida. */
+let generatedPass = null;
+if (cfg.admin && !Object.keys(cfg.users).length) {
+  generatedPass = crypto.randomBytes(6).toString('base64url');
+  cfg.users.admin = generatedPass;
+}
+
+/* ----------------------------------------------------------------- state --- */
+
+const authed = new Set();
+const devices = new Map();
+const sessions = new Map();
+const logBuf = [];
+const openTimers = new Map();
+const loginAttempts = new Map();
+
+const macs = new MacTable({ log: L });
+const marks = new MarkPool(60);
+
+const fw = new Firewall({
+  iface: cfg.iface, gw: cfg.gw, port: cfg.port, dnsPort: cfg.dnsPort,
+  freeMacs: cfg.freeMacs, isolate: cfg.isolate, blockIpv6: cfg.blockIpv6,
+  snoopForceDns: cfg.snoopForceDns, speed: cfg.speed,
+  log: (lvl, m) => L(lvl, m),
 });
 
-/* --- Superficie de administracion ---------------------------------------
- * ADMIN=0 apaga el panel entero: no se registra ninguna ruta /api/*, no se
- * sirve admin.html y no se abre el WebSocket. El portal sigue funcionando
- * (captura, login de clientes, filtrado); solo desaparece el control remoto,
- * que pasa a hacerse editando .env y reiniciando.
- *
- * ADMIN_SHELL=0 deja el panel de monitorizacion pero quita /ws/shell, que es
- * lo unico que ejecuta comandos arbitrarios en el telefono. Util cuando
- * quieres ver dispositivos y log sin exponer una shell.
- *
- * Por defecto ambos quedan en 1 para no cambiar el comportamiento de quien ya
- * usa el proyecto. En un despliegue publico lo recomendable es ADMIN_SHELL=0
- * como minimo, y ADMIN=0 si no necesitas el panel. */
-const ADMIN       = (process.env.ADMIN || '1') !== '0';
-const ADMIN_SHELL = ADMIN && (process.env.ADMIN_SHELL || '1') !== '0';
+const allow = new Allowlist({
+  staticRanges: cfg.staticRanges, widen: cfg.widen, max: cfg.snoopMax,
+  ttlMs: cfg.snoopTtlMs, cachePath: cfg.snoopCache, dir: DIR, fw,
+  log: (lvl, m) => L(lvl, m),
+});
 
-let ALLOW_RANGES = [...STATIC_RANGES];
-const DNS_RESOLVERS = ['1.1.1.1', '8.8.8.8', '9.9.9.9'];
-
-/* Declaradas con "function" a proposito: se hoistean y SNOOP_WIDEN las usa
- * durante la inicializacion de los const de arriba. */
-function ipToInt(ip) {
-  const o = ip.split('.');
-  if (o.length !== 4) return 0;
-  return (((+o[0] << 24) | (+o[1] << 16) | (+o[2] << 8) | +o[3]) >>> 0);
-}
-
-/* Solo se aprenden direcciones unicast publicas. Sin este filtro, un dominio
- * de ALLOW_DOMAINS cuyo DNS devuelva una IP privada (ataque de tipo DNS
- * rebinding, o simplemente un registro mal puesto) abriria la red local a
- * todos los clientes del portal. Tambien descarta 0.0.0.0, que algunos
- * proveedores devuelven como "no aplica". */
-function isPublicUnicast(ip) {
-  const o = ip.split('.').map(Number);
-  if (o.length !== 4 || o.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return false;
-  const [a, b] = o;
-  if (a === 0 || a === 10 || a === 127) return false;
-  if (a === 169 && b === 254) return false;
-  if (a === 172 && b >= 16 && b <= 31) return false;
-  if (a === 192 && b === 168) return false;
-  if (a === 100 && b >= 64 && b <= 127) return false;
-  if (a >= 224) return false;
-  return true;
-}
-
-/* Convierte una IP aprendida en el CIDR que se insertara en la allowlist,
- * aplicando las reglas de SNOOP_WIDEN. Por defecto /32. */
-function toCidr(ip) {
-  const n = ipToInt(ip);
-  for (const w of SNOOP_WIDEN) {
-    if ((n & w.mask) >>> 0 === w.base) {
-      const m = w.to === 0 ? 0 : (0xFFFFFFFF << (32 - w.to)) >>> 0;
-      const net = (n & m) >>> 0;
-      return `${net >>> 24}.${(net >>> 16) & 255}.${(net >>> 8) & 255}.${net & 255}/${w.to}`;
-    }
-  }
-  return `${ip}/32`;
-}
-
-/* Extrae los registros A de una respuesta DNS. Resuelve punteros de
- * compresion al saltar nombres, que es lo que rompe los parsers ingenuos. */
-function parseDnsAnswers(buf) {
-  const out = [];
-  try {
-    const qd = buf.readUInt16BE(4), an = buf.readUInt16BE(6);
-    if (an === 0) return out;
-    let off = 12;
-    const skipName = () => {
-      while (off < buf.length) {
-        const len = buf[off];
-        if (len === 0) { off++; return; }
-        if ((len & 0xC0) === 0xC0) { off += 2; return; }   // puntero: ocupa 2 bytes
-        off += len + 1;
-      }
-    };
-    for (let i = 0; i < qd; i++) { skipName(); off += 4; }
-    for (let i = 0; i < an && off + 10 <= buf.length; i++) {
-      skipName();
-      const type = buf.readUInt16BE(off), cls = buf.readUInt16BE(off + 2);
-      const rdlen = buf.readUInt16BE(off + 8);
-      off += 10;
-      if (type === 1 && cls === 1 && rdlen === 4 && off + 4 <= buf.length) {
-        out.push(`${buf[off]}.${buf[off + 1]}.${buf[off + 2]}.${buf[off + 3]}`);
-      }
-      off += rdlen;
-    }
-  } catch (_) {}
-  return out;
-}
-
-const learned = new Map();   // cidr -> { ts, src }
-
-function saveSnoopCache() {
-  if (!SNOOP_CACHE) return;
-  try {
-    fs.writeFileSync(path.join(__dirname, SNOOP_CACHE),
-      JSON.stringify([...learned.entries()].map(([cidr, v]) => ({ cidr, ...v }))));
-  } catch (_) {}
-}
-
-function loadSnoopCache() {
-  if (!SNOOP_CACHE) return [];
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, SNOOP_CACHE), 'utf8'));
-    return Array.isArray(raw) ? raw.filter(e => e && typeof e.cidr === 'string') : [];
-  } catch (_) { return []; }
-}
-
-/* Anade un CIDR aprendido a la allowlist en caliente. "-I" lo inserta al
- * principio de PORTAL_WA, por delante del "-j DROP" final, asi que empieza a
- * aplicar al instante sin reconstruir la cadena. */
-async function learnCidr(cidr, src, opts = {}) {
-  if (learned.has(cidr) || ALLOW_RANGES.includes(cidr)) return false;
-  if (learned.size >= SNOOP_MAX) {
-    L.warn(`SNOOP tope ${SNOOP_MAX} alcanzado, ignorando ${cidr}`);
-    return false;
-  }
-  learned.set(cidr, { ts: Date.now(), src });
-  ALLOW_RANGES.push(cidr);
-  if (!opts.deferIpt) await ipt(`-I PORTAL_WA -d ${cidr} -j ACCEPT`);
-  if (!opts.quiet) L.ok(`SNOOP +${cidr} (${src})`);
-  saveSnoopCache();
-  return true;
-}
-
-/* Consulta TODOS los resolvers y une los resultados. Uno solo devuelve el PoP
- * mas cercano a ese resolver, no el conjunto: preguntando a varios se
- * descubren los demas prefijos del mismo servicio. */
-async function resolve4All(host) {
-  const out = new Set();
-  await Promise.all(DNS_RESOLVERS.map(srv => new Promise(res => {
-    let done = false;
-    const fin = () => { if (!done) { done = true; res(); } };
-    const t = setTimeout(fin, 5000);
-    try {
-      const r = new dnsMod.Resolver();
-      r.setServers([srv]);
-      r.resolve4(host, (e, a) => {
-        clearTimeout(t);
-        if (!e && Array.isArray(a)) a.forEach(ip => out.add(ip));
-        fin();
-      });
-    } catch (_) { clearTimeout(t); fin(); }
-  })));
-  return [...out];
-}
-
-function T() { return new Date().toTimeString().slice(0, 8); }
-const L = {
-  info: s => console.log(`\x1b[36m[${T()}]\x1b[0m ${s}`),
-  ok:   s => console.log(`\x1b[32m[${T()}]\x1b[0m ${s}`),
-  warn: s => console.log(`\x1b[33m[${T()}]\x1b[0m ${s}`),
-  err:  s => console.log(`\x1b[31m[${T()}]\x1b[0m ${s}`),
-};
-
-const app = express();
-app.use(express.json());
-const server = http.createServer(app);
-
-const authed   = new Set();
-const sessions = new Map();
-const devices  = new Map();
-const log      = [];
+let net = { iface: cfg.iface, gw: cfg.gw, upIface: '', upKind: '', source: '' };
+let portalUrl = '';
 
 function pushLog(mac, ip, type, data) {
-  if (log.length >= LOG_MAX) log.shift();
-  log.push({ ts: Date.now(), mac, ip, type, data });
+  if (logBuf.length >= cfg.logMax) logBuf.shift();
+  logBuf.push({ ts: Date.now(), mac, ip, type, data });
 }
 
-function run(cmd) {
-  try { return execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 }).toString().trim(); }
-  catch (_) { return ''; }
+/* --------------------------------------------------------------- clientes --- */
+
+function isAuthedIp(ip) {
+  const mac = macs.cached(ip);
+  return Boolean(mac && authed.has(mac));
 }
 
-let iptBusy = false;
-const iptQ = [];
-function ipt(rule) {
+async function shapeAuth(mac, ip) {
+  if (!cfg.speed || cfg.freeMacs.has(mac)) return;
+  const stale = marks.byIp(ip);
+  if (stale && stale !== mac) {
+    const e = marks.release(stale);
+    if (e) await fw.tcDel(e.mark, e.ip);
+  }
+  const mine = marks.used.get(mac);
+  if (mine && mine.ip !== ip) await fw.tcDel(mine.mark, mine.ip);
+  if (marks.full()) {
+    const old = marks.oldest();
+    const e = marks.release(old);
+    if (e) { await fw.tcDel(e.mark, e.ip); L.warn(`tc: liberada la marca de ${old}`); }
+  }
+  const e = marks.take(mac, ip);
+  await fw.tcAdd(e.mark, ip);
+}
+
+async function shapeFree(mac) {
+  if (!cfg.speed) return;
+  const e = marks.release(mac);
+  if (e) await fw.tcDel(e.mark, e.ip);
+}
+
+async function authMac(mac, ip) {
+  if (!C.isValidMac(mac)) return false;
+  if (authed.has(mac)) return true;
+  authed.add(mac);
+  if (!devices.has(mac))
+    devices.set(mac, {
+      mac, ip, authedAt: Date.now(), restricted: false, restrictedAt: null,
+      domains: [], free: cfg.freeMacs.has(mac),
+    });
+
+  if (!cfg.freeMacs.has(mac)) {
+    const noWindow = cfg.openMs <= 0;
+    await fw.openMac(mac, { restricted: noWindow });
+    await shapeAuth(mac, ip);
+    const d = devices.get(mac);
+    if (noWindow && d) { d.restricted = true; d.restrictedAt = Date.now(); }
+    if (!noWindow) {
+      const t = setTimeout(() => { openTimers.delete(mac); restrictMac(mac); }, cfg.openMs);
+      if (t.unref) t.unref();
+      openTimers.set(mac, t);
+    }
+  }
+  pushLog(mac, ip, 'auth', null);
+  L.ok(`auth ${mac} ${ip}`);
+  return true;
+}
+
+/* El temporizador de OPEN_MS puede dispararse despues de que el dispositivo ya
+ * haya sido desautenticado; sin esta comprobacion insertaba una regla para una
+ * MAC que ya no esta y quedaba viva hasta el siguiente arranque. */
+async function restrictMac(mac) {
+  if (!authed.has(mac)) return;
+  if (cfg.freeMacs.has(mac)) return;
+  await fw.restrictMac(mac);
+  const d = devices.get(mac);
+  if (d) { d.restricted = true; d.restrictedAt = Date.now(); }
+  L.warn(`restrict ${mac}`);
+}
+
+async function deauthMac(mac) {
+  const t = openTimers.get(mac);
+  if (t) { clearTimeout(t); openTimers.delete(mac); }
+  authed.delete(mac);
+  await shapeFree(mac);
+  await fw.closeMac(mac);
+  devices.delete(mac);
+  pushLog(mac, '', 'deauth', null);
+  L.warn(`deauth ${mac}`);
+}
+
+/* ------------------------------------------------------------- allowlist --- */
+
+function resolve4Via(server, host, timeoutMs = 5000) {
   return new Promise(resolve => {
-    iptQ.push({ rule, resolve });
-    if (!iptBusy) drainIpt();
+    let done = false;
+    const fin = v => { if (!done) { done = true; resolve(v); } };
+    const timer = setTimeout(() => fin([]), timeoutMs);
+    try {
+      const r = new dnsMod.Resolver();
+      r.setServers([server]);
+      r.resolve4(host, (e, a) => {
+        clearTimeout(timer);
+        fin(!e && Array.isArray(a) ? a : []);
+      });
+    } catch (_) { clearTimeout(timer); fin([]); }
   });
 }
-function drainIpt() {
-  if (!iptQ.length) { iptBusy = false; return; }
-  iptBusy = true;
-  const { rule, resolve } = iptQ.shift();
-  exec(`su -c "iptables ${rule}"`, { timeout: 8000 }, () => { resolve(); drainIpt(); });
+
+async function resolve4All(host) {
+  const lists = await Promise.all(cfg.resolvers.map(s => resolve4Via(s, host)));
+  return [...new Set(lists.flat())];
 }
 
-const macCache = new Map();
-const MAC_TTL = 30000;
-const MAC_MISS_TTL = 2500;
-
-const IP_RE  = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
-const MAC_RE = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
-function isValidIp(ip) { return typeof ip === 'string' && IP_RE.test(ip) && ip.split('.').every(o => Number(o) <= 255); }
-function isValidMac(mac) { return typeof mac === 'string' && MAC_RE.test(mac); }
-
-function getMac(ip) {
-  if (!isValidIp(ip)) return null;
-  const hit = macCache.get(ip);
-  if (hit && Date.now() - hit.ts < (hit.mac ? MAC_TTL : MAC_MISS_TTL)) return hit.mac;
-  let mac = null;
-  try {
-    const arp = fs.readFileSync('/proc/net/arp', 'utf8');
-    for (const line of arp.split('\n').slice(1)) {
-      const cols = line.trim().split(/\s+/);
-      if (cols[0] === ip && cols[3] && cols[3] !== '00:00:00:00:00:00') { mac = cols[3].toLowerCase(); break; }
-    }
-  } catch (_) {}
-  if (!mac) {
-    const m = run(`su -c "ip neigh show ${ip}"`).match(/([0-9a-f]{2}(:[0-9a-f]{2}){5})/i);
-    mac = m ? m[1].toLowerCase() : null;
-  }
-  macCache.set(ip, { mac, ts: Date.now() });
-  return mac;
-}
-
-function getMacCached(ip) {
-  const hit = macCache.get(ip);
-  return (hit && hit.mac && Date.now() - hit.ts < MAC_TTL) ? hit.mac : null;
-}
-
-function getGatewayIP() {
-  if (process.env.GW) return process.env.GW;
-  for (const cmd of [
-    `su -c "ip addr show ${IFACE_IN}"`,
-    `ip addr show ${IFACE_IN}`,
-    `ifconfig ${IFACE_IN}`,
-  ]) {
-    const m = run(cmd).match(/inet\s+(?:addr:)?(\d+\.\d+\.\d+\.\d+)/);
-    if (m) return m[1];
-  }
-  L.err(`GW detect failed, fallback`);
-  return '192.168.43.1';
-}
-
-const GW = getGatewayIP();
-const PORTAL_URL = `http://${GW}:${PORT}/`;
-
-const markFree = [];
-let markCtr = 1;
-const markMap = new Map();
-const MARK_MAX = 60;
-
-function allocMark() { return markFree.length ? markFree.pop() : markCtr++; }
-function freeMark(m) { markFree.push(m); }
-function tcCmd(s) { run(`su -c "tc ${s}"`); }
-
-async function initTc() {
-  // Las marcas -t mangle -A FORWARD -d <ip> -j MARK son por IP, no viven en
-  // una cadena propia, y sobreviven a un reinicio del proceso aunque el
-  // Map markMap en memoria se resetee: se limpian aqui para no acumular
-  // marcas huerfanas de sesiones de reinicios anteriores.
-  await ipt(`-t mangle -F FORWARD`);
-  if (!SPEED) return;
-  tcCmd(`qdisc del dev ${IFACE_IN} root 2>/dev/null`);
-  tcCmd(`qdisc add dev ${IFACE_IN} root handle 1: htb default 999`);
-  tcCmd(`class add dev ${IFACE_IN} parent 1: classid 1:999 htb rate 1000mbit`);
-  L.info(`TC SPEED=${SPEED}kb/s on ${IFACE_IN}`);
-}
-
-async function tcFree(mac, e) {
-  markMap.delete(mac);
-  freeMark(e.m);
-  await ipt(`-t mangle -D FORWARD -d ${e.ip} -j MARK --set-mark ${e.m}`);
-  tcCmd(`filter del dev ${IFACE_IN} parent 1: protocol ip handle ${e.m} fw`);
-  tcCmd(`class del dev ${IFACE_IN} parent 1: classid 1:${e.m}`);
-}
-
-async function tcAuth(mac, ip) {
-  if (!SPEED || FREE_MACS.has(mac) || markMap.has(mac)) return;
-  for (const [oldMac, e] of markMap) {
-    if (e.ip === ip) { await tcFree(oldMac, e); L.warn(`TC stale mac=${oldMac} ip=${ip}`); }
-  }
-  if (markMap.size >= MARK_MAX) {
-    const [oldestMac, oldestE] = markMap.entries().next().value;
-    await tcFree(oldestMac, oldestE);
-    L.warn(`TC cap alcanzado, liberando mac=${oldestMac}`);
-  }
-  const m = allocMark();
-  markMap.set(mac, { m, ip });
-  tcCmd(`class add dev ${IFACE_IN} parent 1: classid 1:${m} htb rate ${SPEED}kbit burst ${Math.max(SPEED, 32)}k`);
-  tcCmd(`filter add dev ${IFACE_IN} parent 1: protocol ip handle ${m} fw flowid 1:${m}`);
-  await ipt(`-t mangle -A FORWARD -d ${ip} -j MARK --set-mark ${m}`);
-}
-
-async function tcDeauth(mac) {
-  if (!SPEED) return;
-  const e = markMap.get(mac);
-  if (!e) return;
-  await tcFree(mac, e);
-}
-
-/* Resuelve ALLOW_DOMAINS y SUMA lo encontrado a los rangos estaticos.
- * La version anterior pisaba ALLOW_RANGES con /32 sueltos, asi que perdia la
- * lista fija y se quedaba obsoleta en cuanto el proveedor rotaba de PoP.
- * opts.deferIpt = true durante el arranque, porque PORTAL_WA aun no existe:
- * initRules() volcara ALLOW_RANGES completo al crear la cadena. */
-async function resolveAllowDomains(opts = {}) {
-  if (!ALLOW_DOMAINS.length) return 0;
+async function resolveDomains({ applyRule = true } = {}) {
+  const names = [...cfg.allowDomains];
+  if (cfg.connAllow) names.push(...cfg.connDomains);
+  if (!names.length) return 0;
   let added = 0;
-  for (const d of ALLOW_DOMAINS) {
+  for (const d of names) {
     const addrs = await resolve4All(d);
-    if (!addrs.length) { L.warn(`DOMAIN sin respuesta: ${d}`); continue; }
-    const ok = addrs.filter(isPublicUnicast);
-    for (const ip of ok) if (await learnCidr(toCidr(ip), `boot:${d}`, opts)) added++;
-    L.ok(`DOMAIN ${d} -> ${ok.join(', ') || '(ninguna publica)'}`);
+    const ok = addrs.filter(C.isPublicUnicast);
+    if (!ok.length) { L.warn(`sin respuesta util para ${d}`); continue; }
+    for (const ip of ok) if (await allow.learn(ip, `boot:${d}`, { applyRule })) added++;
   }
   return added;
 }
 
-async function initRules() {
-  L.info(`initRules GW=${GW} IFACE=${IFACE_IN} PORT=${PORT} DNS=${DNS_PORT}`);
-  run(`su -c "iptables -t nat -N PORTAL_PRE 2>/dev/null"`);
-  await ipt(`-t nat -F PORTAL_PRE`);
-  run(`su -c "iptables -t nat -D PREROUTING -i ${IFACE_IN} -j PORTAL_PRE 2>/dev/null"`);
-  await ipt(`-t nat -I PREROUTING -i ${IFACE_IN} -j PORTAL_PRE`);
-  await ipt(`-t nat -A PORTAL_PRE -p udp --dport 53 -j DNAT --to-destination ${GW}:${DNS_PORT}`);
-  await ipt(`-t nat -A PORTAL_PRE -p tcp --dport 80 -j REDIRECT --to-port ${PORT}`);
-  await ipt(`-t nat -A PORTAL_PRE -p tcp --dport 443 -j REDIRECT --to-port ${PORT}`);
-  run(`su -c "iptables -N PORTAL_WA 2>/dev/null"`);
-  await ipt(`-F PORTAL_WA`);
-  // Cadena dedicada para las reglas por-MAC en FORWARD. Antes esas reglas se
-  // insertaban directo en FORWARD y, como el proceso se reinicia seguido
-  // (Termux muere por Android, cortes de luz, etc.) pero iptables es estado
-  // del kernel que sobrevive al reinicio, cada reinicio dejaba huerfanas las
-  // reglas ACCEPT/PORTAL_WA de dispositivos ya desconectados: se iban
-  // acumulando para siempre y algunos MACs viejos quedaban con acceso total
-  // permanente sin que devices/authed (en memoria) supieran que existian.
-  // Con una cadena propia, basta un -F al arrancar para partir de cero.
-  run(`su -c "iptables -N PORTAL_FWD 2>/dev/null"`);
-  await ipt(`-F PORTAL_FWD`);
-  run(`su -c "iptables -D FORWARD -i ${IFACE_IN} -j PORTAL_FWD 2>/dev/null"`);
-  await ipt(`-I FORWARD -i ${IFACE_IN} -j PORTAL_FWD`);
-  for (const r of ALLOW_RANGES) await ipt(`-A PORTAL_WA -d ${r} -j ACCEPT`);
-  // OJO: antes habia un "-m state --state RELATED,ESTABLISHED -j ACCEPT" aqui.
-  // Eso es innecesario para trafico WA legitimo (las reglas -d de arriba ya
-  // aceptan cada paquete, sea NEW o ESTABLISHED, mientras el destino este en
-  // ALLOW_RANGES) y ademas era un hueco: cualquier conexion larga abierta
-  // durante la ventana OPEN_MS (7s libres) hacia CUALQUIER destino quedaba
-  // "ESTABLISHED" y seguia aceptandose para siempre tras la restriccion,
-  // sin importar a donde apuntara. Se quita para que PORTAL_WA solo deje
-  // pasar trafico realmente destinado a los rangos permitidos.
-  await ipt(`-A PORTAL_WA -j DROP`);
-  run(`su -c "iptables -D INPUT -i ${IFACE_IN} -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null"`);
-  await ipt(`-I INPUT -i ${IFACE_IN} -p tcp --dport ${PORT} -j ACCEPT`);
-  for (const mac of FREE_MACS) {
-    run(`su -c "iptables -D PORTAL_FWD -m mac --mac-source ${mac} -j ACCEPT 2>/dev/null"`);
-    await ipt(`-I PORTAL_FWD -m mac --mac-source ${mac} -j ACCEPT`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p udp --dport 53 -j RETURN`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 443 -j RETURN`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 80 -j RETURN`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -d ${GW} -p tcp --dport 80 -j REDIRECT --to-port ${PORT}`);
-    L.ok(`FREE_MAC pre-auth: ${mac}`);
+/* ------------------------------------------------------------------ http --- */
+
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '256kb' }));
+
+function clientIp(req) {
+  /* No hay proxy delante: X-Forwarded-For lo pone el propio cliente y confiar
+   * en el permitia inyectar texto arbitrario donde antes se usaba la IP para
+   * construir comandos. */
+  return String(req.socket.remoteAddress || '').replace('::ffff:', '');
+}
+
+function isLoopback(ip) { return ip === '127.0.0.1' || ip === '::1'; }
+
+function cookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
   }
+  return out;
 }
 
-async function restrictMac(mac) {
-  await ipt(`-D PORTAL_FWD -m mac --mac-source ${mac} -j ACCEPT`);
-  if (!FREE_MACS.has(mac)) await ipt(`-I PORTAL_FWD -m mac --mac-source ${mac} -j PORTAL_WA`);
-  const d = devices.get(mac);
-  if (d) { d.restricted = true; d.restrictedAt = Date.now(); }
-  L.warn(`RESTRICT ${mac}`);
+/* El token solo viaja por cabecera o cookie. Aceptarlo por query lo deja
+ * escrito en logs y en la cabecera Referer de cualquier recurso externo. */
+function tokenOf(req) {
+  return req.headers['x-admin-token'] || cookies(req).at || null;
 }
 
-async function authMac(mac, ip) {
-  if (authed.has(mac)) return;
-  authed.add(mac);
-  if (!devices.has(mac))
-    devices.set(mac, { mac, ip, authedAt: Date.now(), restricted: false, restrictedAt: null, domains: [], free: FREE_MACS.has(mac) });
-  if (!FREE_MACS.has(mac)) {
-    /* Con SNOOP_FORCE_DNS=1 NO se exime el 53: el DNS del dispositivo sigue
-     * pasando por este servidor, que es lo que permite aprender las IPs de
-     * ALLOW_DOMAINS del trafico real. Por defecto (0) se mantiene el
-     * comportamiento original: tras autenticar, el DNS va directo al resolver. */
-    if (!SNOOP_FORCE_DNS)
-      await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p udp --dport 53 -j RETURN`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 80 -j RETURN`);
-    await ipt(`-t nat -I PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 443 -j RETURN`);
-    await ipt(`-I PORTAL_FWD -m mac --mac-source ${mac} -j ACCEPT`);
-    await tcAuth(mac, ip);
-    setTimeout(() => restrictMac(mac), OPEN_MS);
-  }
-  pushLog(mac, ip, 'auth', null);
-  L.ok(`AUTH ${mac} ${ip}`);
-}
-
-async function deauthMac(mac) {
-  authed.delete(mac);
-  await tcDeauth(mac);
-  if (!SNOOP_FORCE_DNS)
-    await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p udp --dport 53 -j RETURN`);
-  await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 80 -j RETURN`);
-  await ipt(`-t nat -D PORTAL_PRE -m mac --mac-source ${mac} -p tcp --dport 443 -j RETURN`);
-  await ipt(`-D PORTAL_FWD -m mac --mac-source ${mac} -j ACCEPT`);
-  await ipt(`-D PORTAL_FWD -m mac --mac-source ${mac} -j PORTAL_WA`);
-  devices.delete(mac);
-  pushLog(mac, '', 'deauth', null);
-  L.warn(`DEAUTH ${mac}`);
-}
-
-function parseDnsName(buf) {
-  try {
-    let off = 12, name = '';
-    while (buf[off]) {
-      if (name) name += '.';
-      name += buf.slice(off + 1, off + 1 + buf[off]).toString();
-      off += buf[off] + 1;
-    }
-    return name.toLowerCase();
-  } catch (_) { return ''; }
-}
-
-function isConnHost(name) {
-  return CONN_HOSTS.some(h => name === h || name.endsWith('.' + h));
-}
-
-function isAllowedDomain(name) {
-  return ALLOW_DOMAINS.some(d => name === d || name.endsWith('.' + d));
-}
-
-/* Nucleo del aprendizaje: lee las IPs de una respuesta DNS ya validada como
- * perteneciente a ALLOW_DOMAINS y las mete en la allowlist. Se lanza sin await
- * para no frenar la respuesta al cliente; la cola ipt() serializa el resto. */
-function snoopResponse(buf, qname) {
-  for (const ip of parseDnsAnswers(buf)) {
-    if (!isPublicUnicast(ip)) continue;
-    learnCidr(toCidr(ip), `snoop:${qname}`).catch(() => {});
-  }
-}
-
-function dnsReply(reqBuf, ip) {
-  try {
-    const id = reqBuf.slice(0, 2);
-    let off = 12;
-    while (off < reqBuf.length && reqBuf[off] !== 0) off += reqBuf[off] + 1;
-    off++;
-    const qdSection = reqBuf.slice(12, off + 4);
-    const parts = ip.split('.').map(Number);
-    const res = Buffer.alloc(12 + qdSection.length + 16);
-    id.copy(res, 0);
-    res.writeUInt16BE(0x8180, 2);
-    res.writeUInt16BE(1, 4);
-    res.writeUInt16BE(1, 6);
-    res.writeUInt16BE(0, 8);
-    res.writeUInt16BE(0, 10);
-    qdSection.copy(res, 12);
-    const a = 12 + qdSection.length;
-    res.writeUInt16BE(0xc00c, a);
-    res.writeUInt16BE(1, a + 2);
-    res.writeUInt16BE(1, a + 4);
-    res.writeUInt32BE(10, a + 6);
-    res.writeUInt16BE(4, a + 10);
-    parts.forEach((b, i) => { res[a + 12 + i] = b; });
-    return res;
-  } catch (_) { return null; }
-}
-
-let fwdActive = 0;
-const FWD_MAX = 8;
-
-function forwardDns(msg, rinfo, idx = 0, qname = '') {
-  if (idx >= DNS_RESOLVERS.length) return;
-  if (fwdActive >= FWD_MAX) return;
-  fwdActive++;
-  const sock = dgram.createSocket('udp4');
-  let closed = false;
-  const done = (ok) => {
-    if (closed) return;
-    closed = true;
-    fwdActive--;
-    try { sock.close(); } catch (_) {}
-    if (!ok) forwardDns(msg, rinfo, idx + 1, qname);
-  };
-  sock.on('message', r => {
-    dnsServer.send(r, rinfo.port, rinfo.address);
-    if (SNOOP && qname && isAllowedDomain(qname)) snoopResponse(r, qname);
-    done(true);
-  });
-  sock.on('error', () => done(false));
-  sock.send(msg, 53, DNS_RESOLVERS[idx]);
-  setTimeout(() => done(false), 5000);
-}
-
-const dnsServer = dgram.createSocket('udp4');
-dnsServer.on('error', e => L.err(`DNS ${e.message}`));
-dnsServer.on('message', (msg, rinfo) => {
-  const name = parseDnsName(msg);
-  if (name) {
-    const mac = getMacCached(rinfo.address);
-    if (mac && devices.has(mac)) {
-      const d = devices.get(mac);
-      if (!d.domains.includes(name)) {
-        if (d.domains.length >= 200) d.domains.shift();
-        d.domains.push(name);
-      }
-      pushLog(mac, rinfo.address, 'dns', name);
-    }
-  }
-  if (isConnHost(name) || isAllowedDomain(name)) forwardDns(msg, rinfo, 0, name);
-  else {
-    const reply = dnsReply(msg, GW);
-    if (reply) dnsServer.send(reply, rinfo.port, rinfo.address);
-  }
-});
-
-const CLEAN_CONCURRENCY = 5;
-
-setInterval(async () => {
-  const macs = [...devices.keys()].filter(m => !FREE_MACS.has(m));
-  for (let i = 0; i < macs.length; i += CLEAN_CONCURRENCY) {
-    await Promise.all(macs.slice(i, i + CLEAN_CONCURRENCY).map(deauthMac));
-  }
-  if (macs.length) L.info(`Cleanup: ${macs.length} deautenticados`);
-}, CLEAN_MS);
-
-function getCookies(req) {
-  const c = {};
-  (req.headers.cookie || '').split(';').forEach(s => {
-    const [k, ...v] = s.trim().split('=');
-    if (k) c[k.trim()] = v.join('=');
-  });
-  return c;
-}
-
-function getToken(req) {
-  if (req.headers['x-admin-token']) return req.headers['x-admin-token'];
-  const ck = getCookies(req).at;
-  if (ck) return ck;
-  const u = new URL(req.url || '/', 'http://localhost');
-  return u.searchParams.get('t') || null;
-}
-
-function getIP(req) {
-  // No hay reverse proxy delante de este portal: el cliente en el hotspot
-  // habla directo con este proceso, asi que X-Forwarded-For es un header
-  // que el propio cliente puede falsificar libremente. Confiar en el
-  // permitia inyectar comandos via getMac() -> `su -c "ip neigh show <ip>"`.
-  // Se usa unicamente la IP real del socket.
-  return (req.socket.remoteAddress || '').replace('::ffff:', '');
+function sessionOf(req) {
+  const t = tokenOf(req);
+  if (!t) return null;
+  const s = sessions.get(t);
+  if (!s) return null;
+  if (cfg.sessionTtlMs && Date.now() - s.ts > cfg.sessionTtlMs) { sessions.delete(t); return null; }
+  s.ts = Date.now();
+  return { token: t, ...s };
 }
 
 function adminAuth(req, res, next) {
-  const token = getToken(req);
-  if (token && sessions.has(token)) return next();
-  res.status(401).json({ err: 'Unauthorized' });
+  const s = sessionOf(req);
+  if (!s) return res.status(401).json({ err: 'Unauthorized' });
+  req.session = s;
+  next();
 }
 
-// Freno simple de fuerza bruta por IP: sin esto, cualquiera en el hotspot
-// podia probar contraseñas para ADMIN_USERS sin limite, y ese login abre
-// paso al shell remoto (/ws/shell). 5 intentos fallidos = 60s de bloqueo,
-// doblando el bloqueo en cada racha de fallos subsiguiente.
-const loginAttempts = new Map();
 function loginBlocked(ip) {
   const a = loginAttempts.get(ip);
-  return a && a.fails >= 5 && Date.now() < a.until;
+  return Boolean(a && a.fails >= 5 && Date.now() < a.until);
 }
 function loginFail(ip) {
   const a = loginAttempts.get(ip) || { fails: 0, until: 0 };
   a.fails++;
-  if (a.fails >= 5) a.until = Date.now() + Math.min(30 * 60000, 60000 * Math.pow(2, a.fails - 5));
+  if (a.fails >= 5) a.until = Date.now() + Math.min(30 * 60000, 60000 * 2 ** (a.fails - 5));
   loginAttempts.set(ip, a);
 }
-function loginOk(ip) { loginAttempts.delete(ip); }
 
-/* Con ADMIN=0 el panel no existe: este guard atrapa cualquier /api/* antes de
- * que llegue a su handler y responde 404, asi no se filtra ni que la ruta
- * existe. Se usa app.use con test manual y no un patron de ruta porque este
- * proyecto va con Express 5, donde los comodines tipo '/api/*' cambiaron de
- * sintaxis. "/auth" (el login de los CLIENTES del portal) no empieza por
- * /api, asi que no se ve afectado. */
-if (!ADMIN) {
-  app.use((req, res, next) => /^\/api(\/|$)/.test(req.path) ? res.status(404).end() : next());
+function samePass(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  if (x.length !== y.length) return false;
+  return crypto.timingSafeEqual(x, y);
+}
+
+if (!cfg.admin) {
+  app.use((req, res, next) => (/^\/api(\/|$)/.test(req.path) ? res.status(404).end() : next()));
 }
 
 app.post('/api/login', async (req, res) => {
-  const ip = getIP(req);
+  const ip = clientIp(req);
   if (loginBlocked(ip)) {
-    L.warn(`LOGIN blocked (bruteforce) ip=${ip}`);
+    L.warn(`login bloqueado por intentos ip=${ip}`);
     return res.status(429).json({ err: 'Demasiados intentos, espera' });
   }
-  const mac = getMac(ip);
-  if (!mac || !FREE_MACS.has(mac)) {
+  const mac = isLoopback(ip) ? null : await macs.lookup(ip);
+  const allowedHost = isLoopback(ip) || (mac && cfg.freeMacs.has(mac));
+  if (!allowedHost) {
     loginFail(ip);
-    L.warn(`LOGIN deny mac=${mac || '?'} ip=${ip}`);
+    L.warn(`login denegado mac=${mac || '?'} ip=${ip}`);
     return res.status(403).json({ err: 'Forbidden' });
   }
   const { user, pass } = req.body || {};
-  if (ADMIN_USERS[user] && ADMIN_USERS[user] === pass) {
-    loginOk(ip);
-    const token = crypto.randomBytes(16).toString('hex');
-    sessions.set(token, user);
-    res.setHeader('Set-Cookie', `at=${token};Path=/;HttpOnly`);
-    await authMac(mac, ip);
-    L.ok(`LOGIN ok user=${user} ip=${ip} mac=${mac}`);
-    res.json({ ok: true, token, user, free: FREE_MACS.has(mac) });
-  } else {
+  const known = typeof user === 'string' && Object.prototype.hasOwnProperty.call(cfg.users, user);
+  if (!known || !samePass(cfg.users[user], pass || '')) {
     loginFail(ip);
-    L.warn(`LOGIN fail user=${user} ip=${ip}`);
-    res.status(401).json({ ok: false });
+    L.warn(`login fallido user=${user} ip=${ip}`);
+    return res.status(401).json({ ok: false });
   }
+  loginAttempts.delete(ip);
+  const token = crypto.randomBytes(24).toString('hex');
+  sessions.set(token, { user, ts: Date.now(), ip });
+  res.setHeader('Set-Cookie', `at=${token};Path=/;HttpOnly;SameSite=Strict;Max-Age=${Math.floor(cfg.sessionTtlMs / 1000)}`);
+  if (mac) await authMac(mac, ip);
+  L.ok(`login ok user=${user} ip=${ip}`);
+  res.json({ ok: true, user, free: Boolean(mac && cfg.freeMacs.has(mac)) });
 });
 
 app.post('/api/logout', adminAuth, (req, res) => {
-  const user = sessions.get(getToken(req));
-  sessions.delete(getToken(req));
-  L.info(`LOGOUT user=${user}`);
+  sessions.delete(req.session.token);
+  res.setHeader('Set-Cookie', 'at=;Path=/;HttpOnly;SameSite=Strict;Max-Age=0');
+  L.info(`logout ${req.session.user}`);
   res.json({ ok: true });
 });
 
-app.get('/api/me', adminAuth, (req, res) => {
-  res.json({ user: sessions.get(getToken(req)) });
+app.get('/api/me', adminAuth, (req, res) => res.json({ user: req.session.user }));
+
+app.get('/api/status', adminAuth, (req, res) => {
+  res.json({
+    net,
+    portalUrl,
+    allow: allow.stats(),
+    dns: dnsProxy ? dnsProxy.stats : null,
+    devices: devices.size,
+    authed: authed.size,
+    openMs: cfg.openMs,
+    speed: cfg.speed,
+    isolate: cfg.isolate,
+    blockIpv6: cfg.blockIpv6,
+    snoop: cfg.snoop,
+    adminShell: cfg.adminShell,
+  });
 });
 
 app.get('/api/devices', adminAuth, (req, res) => res.json([...devices.values()]));
 
+app.get('/api/allow', adminAuth, (req, res) => res.json({ fixed: allow.fixed, learned: allow.entries() }));
+
 app.post('/api/deauth/:mac', adminAuth, async (req, res) => {
-  const mac = (req.params.mac || '').toLowerCase();
-  if (!isValidMac(mac)) return res.status(400).json({ err: 'MAC invalida' });
-  if (FREE_MACS.has(mac)) return res.status(400).json({ err: 'Cannot deauth free MAC' });
+  const mac = String(req.params.mac || '').toLowerCase();
+  if (!C.isValidMac(mac)) return res.status(400).json({ err: 'MAC invalida' });
+  if (cfg.freeMacs.has(mac)) return res.status(400).json({ err: 'Es una MAC libre' });
   await deauthMac(mac);
   res.json({ ok: true });
 });
 
-app.get('/api/log', adminAuth, (req, res) => res.json(log.slice(-200)));
+app.get('/api/log', adminAuth, (req, res) => res.json(logBuf.slice(-200)));
 
 app.get('/api/env', adminAuth, (req, res) => {
-  const p = path.join(__dirname, '.env');
+  const p = path.join(DIR, '.env');
   res.json({ content: fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '' });
 });
 
+/* Los valores de .env acaban dentro de comandos ejecutados como root, asi que
+ * lo que se guarde tiene que pasar la misma validacion que al arrancar: con
+ * ADMIN_SHELL=0 esta era la via que quedaba para ejecutar codigo arbitrario. */
 app.post('/api/env', adminAuth, (req, res) => {
   const { content } = req.body || {};
   if (typeof content !== 'string') return res.status(400).json({ err: 'invalid' });
-  fs.writeFileSync(path.join(__dirname, '.env'), content, 'utf8');
-  L.info(`ENV saved by ${sessions.get(getToken(req))}`);
-  // Los valores de .env se cargan una sola vez al arrancar (const's arriba),
-  // guardar aqui NO los aplica en caliente. Se avisa explicitamente para
-  // no dar la falsa impresion de que el cambio ya esta activo.
-  res.json({ ok: true, note: 'Guardado. Reinicia el proceso (POST /api/stop) para aplicar los cambios.' });
+  const candidate = C.buildConfig(C.parseEnv(content));
+  if (candidate.fatal.length)
+    return res.status(400).json({ err: 'Valores invalidos', detail: candidate.fatal });
+  fs.writeFileSync(path.join(DIR, '.env'), content, 'utf8');
+  L.info(`.env guardado por ${req.session.user}`);
+  res.json({
+    ok: true,
+    warn: candidate.warn,
+    note: 'Guardado. Reinicia el proceso para aplicarlo (POST /api/stop si x.sh lo relanza).',
+  });
 });
 
 app.post('/api/stop', adminAuth, (req, res) => {
-  L.warn(`STOP requested by ${sessions.get(getToken(req))}`);
+  L.warn(`stop pedido por ${req.session.user}`);
   res.json({ ok: true });
-  setTimeout(() => process.exit(0), 300);
+  setTimeout(() => shutdown('api', EXIT.restart), 300);
 });
 
-/* Con ADMIN_SHELL=0 el WebSocket no se crea siquiera: el endpoint /ws/shell no
- * existe y no hay forma de llegar al spawn(). Es la unica parte del panel que
- * ejecuta comandos arbitrarios en el telefono. */
-const wss = ADMIN_SHELL ? new WebSocketServer({ server, path: '/ws/shell' }) : null;
-wss?.on('connection', (ws, req) => {
-  const ip = getIP(req);
-  const token = getToken(req);
-  if (!token || !sessions.has(token)) { ws.close(1008, 'Unauthorized'); return; }
-  const user = sessions.get(token);
-  L.info(`WS shell opened user=${user} ip=${ip}`);
-  let activeProc = null;
-
-  ws.on('message', data => {
-    const cmd = data.toString().trim();
-    if (!cmd) return;
-    if (activeProc) { try { activeProc.kill(); } catch (_) {} }
-    L.info(`CMD [${user}] ${cmd}`);
-    const proc = spawn(TERMUX_SH, ['-c', cmd], {
-      env: {
-        PATH: `/data/data/com.termux/files/usr/bin:${process.env.PATH || '/system/bin:/system/xbin'}`,
-        HOME: '/data/data/com.termux/files/home',
-        PREFIX: '/data/data/com.termux/files/usr',
-        TMPDIR: '/data/data/com.termux/files/usr/tmp',
-      }
-    });
-    activeProc = proc;
-    let out = '', err = '';
-    proc.stdout.on('data', d => { out += d.toString(); });
-    proc.stderr.on('data', d => { err += d.toString(); });
-    const timer = setTimeout(() => { try { proc.kill(); } catch (_) {} }, 10000);
-    proc.on('close', () => {
-      clearTimeout(timer);
-      activeProc = null;
-      if (ws.readyState === 1)
-        ws.send(JSON.stringify({ stdout: out, stderr: err, err: null }));
-    });
-    proc.on('error', e => {
-      if (ws.readyState === 1)
-        ws.send(JSON.stringify({ stdout: '', stderr: '', err: e.message }));
-    });
-  });
-
-  ws.on('close', () => {
-    if (activeProc) { try { activeProc.kill(); } catch (_) {} }
-    L.info(`WS shell closed user=${user}`);
-  });
-});
+/* -------------------------------------------------- portal cautivo (http) --- */
 
 const CP_HTML = '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>';
 const CP_CHECKS = {
@@ -782,57 +389,310 @@ const CP_CHECKS = {
   '/canonical.html':            CP_HTML,
   '/redirect':                  CP_HTML,
 };
+
 app.get(Object.keys(CP_CHECKS), (req, res) => {
-  const mac = getMacCached(getIP(req));
-  if (mac && authed.has(mac)) return res.send(CP_CHECKS[req.path]);
-  res.redirect(302, PORTAL_URL);
-});
-app.get(['/generate_204', '/gen_204', '/204'], (req, res) => {
-  const mac = getMacCached(getIP(req));
-  if (mac && authed.has(mac)) return res.status(204).send();
-  res.redirect(302, PORTAL_URL);
+  res.set('Cache-Control', 'no-store');
+  if (isAuthedIp(clientIp(req))) return res.send(CP_CHECKS[req.path]);
+  res.redirect(302, portalUrl);
 });
 
-const BLOCKED = /^\/(\.env(\.|$)|server\.js|package(-lock)?\.json|\.git(\/|$)|x\.sh|\.npmrc|node_modules(\/|$)|\.snoop\.json$|\.gitattributes$)/i;
-/* admin.html lo sirve express.static, asi que sin esto seguiria descargandose
- * con ADMIN=0 (solo la UI, las /api ya dan 404, pero no hay motivo para
- * entregarla ni para anunciar que el panel existe). */
-const BLOCKED_ADMIN = /^\/admin\.html$/i;
-app.use((req, res, next) =>
-  (BLOCKED.test(req.path) || (!ADMIN && BLOCKED_ADMIN.test(req.path)))
-    ? res.status(404).end() : next());
-app.use(express.static(path.join(__dirname)));
+app.get(['/generate_204', '/gen_204', '/204'], (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (isAuthedIp(clientIp(req))) return res.status(204).end();
+  res.redirect(302, portalUrl);
+});
 
 app.post('/auth', async (req, res) => {
-  const ip = getIP(req);
-  const mac = getMac(ip);
-  if (mac) { await authMac(mac, ip); res.json({ ok: true }); }
-  else {
-    L.warn(`AUTH fail: no MAC ip=${ip}`);
-    res.json({ ok: false, err: 'MAC no encontrada' });
+  const ip = clientIp(req);
+  const mac = await macs.lookup(ip);
+  if (!mac) {
+    L.warn(`auth sin MAC ip=${ip}`);
+    return res.json({ ok: false, err: 'MAC no encontrada' });
   }
+  await authMac(mac, ip);
+  res.json({ ok: true });
 });
 
+if (cfg.admin) {
+  app.get('/admin.html', (req, res) => res.sendFile(path.join(DIR, 'admin.html')));
+}
+
+/* Solo se sirve public/: con una lista negra sobre __dirname, cualquier
+ * archivo nuevo en la carpeta (un .env.bak, notas, un volcado) queda publicado
+ * hasta que alguien se acuerde de anadirlo a la lista. */
+app.use(express.static(PUBLIC_DIR, { index: 'index.html', dotfiles: 'deny' }));
+
+app.use((req, res) => {
+  if (req.method === 'GET' && req.accepts('html')) return res.redirect(302, portalUrl);
+  res.status(404).end();
+});
+
+/* --------------------------------------------------------------- ws shell --- */
+
+let wss = null;
+function setupShell(server) {
+  if (!cfg.adminShell || wss) return;
+  wss = new WebSocketServer({ server, path: '/ws/shell' });
+  wss.on('connection', (ws, req) => {
+    /* El WebSocket no pasa por CORS: sin comprobar Origin, cualquier pagina
+     * que abra el admin puede conectarse con su cookie y ejecutar comandos. */
+    const origin = req.headers.origin;
+    if (origin) {
+      let host = '';
+      try { host = new URL(origin).host; } catch (_) {}
+      if (host !== req.headers.host) { ws.close(1008, 'Origin'); return; }
+    }
+    const s = sessionOf(req);
+    if (!s) { ws.close(1008, 'Unauthorized'); return; }
+    const user = s.user;
+    L.info(`shell abierta por ${user}`);
+    let active = null;
+
+    ws.on('message', data => {
+      const cmd = data.toString().trim();
+      if (!cmd) return;
+      if (active) { try { active.kill(); } catch (_) {} }
+      L.info(`cmd [${user}] ${cmd}`);
+      const proc = spawn(TERMUX_SH, ['-c', cmd], {
+        env: {
+          PATH: `/data/data/com.termux/files/usr/bin:${process.env.PATH || '/system/bin'}`,
+          HOME: '/data/data/com.termux/files/home',
+          PREFIX: '/data/data/com.termux/files/usr',
+          TMPDIR: '/data/data/com.termux/files/usr/tmp',
+        },
+      });
+      active = proc;
+      let out = '', err = '';
+      proc.stdout.on('data', d => { out += d; });
+      proc.stderr.on('data', d => { err += d; });
+      const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 10000);
+      proc.on('close', () => {
+        clearTimeout(timer);
+        active = null;
+        if (ws.readyState === 1) ws.send(JSON.stringify({ stdout: out, stderr: err, err: null }));
+      });
+      proc.on('error', e => {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ stdout: '', stderr: '', err: e.message }));
+      });
+    });
+
+    ws.on('close', () => {
+      if (active) { try { active.kill(); } catch (_) {} }
+      L.info(`shell cerrada por ${user}`);
+    });
+  });
+}
+
+/* --------------------------------------------------------------- arranque --- */
+
+let dnsProxy = null;
+let servers = [];
+
+function closeServers() {
+  for (const s of servers) { try { s.close(); } catch (_) {} }
+  servers = [];
+  if (wss) { try { wss.close(); } catch (_) {} wss = null; }
+}
+
+function listenOn(addr) {
+  return new Promise(resolve => {
+    const srv = http.createServer(app);
+    srv.on('error', e => { L.err(`http ${addr}: ${e.message}`); resolve(null); });
+    srv.listen(cfg.port, addr, () => resolve(srv));
+  });
+}
+
+async function bindServers() {
+  closeServers();
+  /* Escuchar en 0.0.0.0 publicaba el panel y el DNS en datos moviles y en
+   * cualquier otra wifi del telefono. Solo el hotspot y loopback. */
+  for (const addr of [net.gw, '127.0.0.1']) {
+    const srv = await listenOn(addr);
+    if (srv) { servers.push(srv); setupShell(srv); }
+  }
+  if (!servers.length) throw new Error(`no se pudo escuchar en ${net.gw}:${cfg.port}`);
+  L.ok(`portal http://${net.gw}:${cfg.port}/`);
+
+  if (dnsProxy) dnsProxy.stop();
+  dnsProxy = new DnsProxy({
+    port: cfg.dnsPort,
+    bindAddr: net.gw,
+    gw: net.gw,
+    resolvers: cfg.resolvers,
+    allowDomains: cfg.allowDomains,
+    connDomains: cfg.connDomains,
+    blockIpv6: cfg.blockIpv6,
+    snoop: cfg.snoop,
+    allowlist: allow,
+    isAuthed: isAuthedIp,
+    onQuery: recordQuery,
+    log: (lvl, m) => L(lvl, m),
+  });
+  await dnsProxy.start();
+  L.ok(`dns ${net.gw}:${cfg.dnsPort}`);
+}
+
+function recordQuery(ip, name) {
+  const mac = macs.cached(ip);
+  if (!mac) { macs.refresh().catch(() => {}); return; }
+  const d = devices.get(mac);
+  if (d) {
+    if (!d.domains.includes(name)) {
+      if (d.domains.length >= 200) d.domains.shift();
+      d.domains.push(name);
+    }
+  }
+  pushLog(mac, ip, 'dns', name);
+}
+
+async function waitForHotspot() {
+  let warned = false;
+  for (;;) {
+    const r = await detectMod.detect({ iface: cfg.iface, gw: cfg.gw });
+    if (r.ok) return r;
+    if (!warned) {
+      L.warn('No encuentro la interfaz del hotspot. Activa el anclaje; se vuelve a intentar cada 5s.');
+      if (r.notes.length) for (const n of r.notes) L.warn(n);
+      warned = true;
+    }
+    await new Promise(r2 => setTimeout(r2, 5000));
+  }
+}
+
+async function applyNet(r, { first = false } = {}) {
+  net = { iface: r.iface, gw: r.gw, upIface: r.upIface, upKind: r.upKind, source: r.source };
+  portalUrl = `http://${r.gw}:${cfg.port}/`;
+  fw.set({ iface: r.iface, gw: r.gw });
+
+  const res = await fw.apply(allow.all());
+  if (res.noRoot) {
+    L.err('Sin root no se puede filtrar nada. El portal no arranca para no dar una falsa sensacion de control.');
+    process.exit(1);
+  }
+  await fw.initTc();
+
+  const v = await fw.verify();
+  if (!v.ok) {
+    L.err(`autotest de reglas FALLIDO: ${JSON.stringify(v)}`);
+    L.err('El trafico NO esta filtrado. Revisa root, el modulo xt_mac y la interfaz.');
+  } else {
+    L.ok(`reglas activas y verificadas en ${r.iface}`);
+  }
+
+  await bindServers();
+  if (!first) {
+    for (const mac of [...devices.keys()]) await deauthMac(mac);
+  }
+  L.info(`hotspot ${r.iface} (${r.gw}) | salida ${r.upIface || '?'} [${r.upKind}] | deteccion: ${r.source || 'manual'}`);
+  for (const n of r.notes) L.warn(n);
+}
+
+/* La interfaz y la subred del hotspot las elige la ROM y cambian al
+ * reactivarlo. Si el DNAT sigue apuntando a la IP vieja, los clientes se
+ * quedan sin DNS y nada lo delata. */
+function startWatcher() {
+  if (!cfg.detectMs) return;
+  const timer = setInterval(async () => {
+    try {
+      /* ip addr e ip route se leen sin root; dumpsys solo se consulta cuando
+       * algo cambio, para no invocar su cada pocos segundos. */
+      const cheap = await detectMod.detect({ useRoot: false, iface: cfg.iface || net.iface, gw: cfg.gw });
+      if (cheap.ok && cheap.iface === net.iface && cheap.gw === net.gw && fw.applied) {
+        if (cheap.upIface && cheap.upIface !== net.upIface) {
+          net.upIface = cheap.upIface;
+          net.upKind = cheap.upKind;
+          L.info(`la salida cambio a ${cheap.upIface} [${cheap.upKind}]`);
+        }
+        return;
+      }
+
+      const r = await detectMod.detect({ iface: cfg.iface, gw: cfg.gw });
+      if (!r.ok) {
+        if (fw.applied) {
+          L.warn('el hotspot desaparecio; se retiran las reglas');
+          await fw.teardown();
+        }
+        return;
+      }
+      if (r.iface !== net.iface || r.gw !== net.gw || !fw.applied) {
+        L.warn(`cambio de red: ${net.iface}/${net.gw} -> ${r.iface}/${r.gw}`);
+        await applyNet(r);
+      } else if (r.upIface !== net.upIface) {
+        net.upIface = r.upIface;
+        net.upKind = r.upKind;
+        L.info(`la salida cambio a ${r.upIface} [${r.upKind}]`);
+      }
+    } catch (e) { L.err(`watcher: ${e.message}`); }
+  }, Math.max(3000, cfg.detectMs));
+  if (timer.unref) timer.unref();
+}
+
+/* Codigos de salida: x.sh relanza solo con 70 (caida) y 75 (reinicio pedido
+ * desde el panel). Con 0 y 1 se queda parado, para que Ctrl-C pare de verdad y
+ * un error de configuracion no entre en bucle. */
+const EXIT = { stop: 0, config: 1, crash: 70, restart: 75 };
+
+let shuttingDown = false;
+async function shutdown(why, code = EXIT.stop) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  L.warn(`cerrando (${why})`);
+  try { if (dnsProxy) dnsProxy.stop(); } catch (_) {}
+  closeServers();
+  allow.save();
+  /* Las reglas son estado del kernel y sobreviven al proceso: si no se quitan,
+   * el 53 sigue redirigido a un puerto muerto y el hotspot queda sin DNS. */
+  try { await fw.teardown(); L.ok('reglas retiradas'); } catch (e) { L.err(`teardown: ${e.message}`); }
+  process.exit(code);
+}
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => shutdown(sig));
+process.on('uncaughtException', e => { L.err(`excepcion: ${e.stack || e.message}`); shutdown('uncaughtException', EXIT.crash); });
+process.on('unhandledRejection', e => L.err(`promesa sin capturar: ${(e && e.message) || e}`));
+
 (async () => {
-  /* Lo aprendido en arranques anteriores se recupera ANTES de construir
-   * PORTAL_WA, asi el portal ya nace con la allowlist completa en vez de tener
-   * que reaprenderla con la primera consulta de cada cliente. */
-  for (const e of loadSnoopCache())
-    await learnCidr(e.cidr, e.src || 'cache', { deferIpt: true, quiet: true });
-  await resolveAllowDomains({ deferIpt: true });
-  await initRules();
-  await initTc();
-  if (SNOOP && SNOOP_REFRESH_MS > 0)
-    setInterval(() => resolveAllowDomains().catch(() => {}), SNOOP_REFRESH_MS);
-  L.info(`Allowlist: ${ALLOW_RANGES.length} CIDR (${STATIC_RANGES.length} fijos, ${learned.size} aprendidos)` +
-         ` | SNOOP=${SNOOP ? 'on' : 'off'}${SNOOP_FORCE_DNS ? ' force-dns' : ''}` +
-         ` | widen=${SNOOP_WIDEN.length}`);
-  if (!ALLOW_RANGES.length) L.warn('Allowlist VACIA: nadie podra salir. Revisa ALLOW_RANGES / ALLOW_DOMAINS.');
-  L.info(`Panel: ADMIN=${ADMIN ? 'on' : 'OFF'} shell=${ADMIN_SHELL ? 'on' : 'OFF'}`);
-  if (ADMIN && !process.env.ADMIN_USERS)
-    L.warn('ADMIN_USERS sin definir: se esta usando el default admin:1234. Cambialo o pon ADMIN=0.');
-  if (ADMIN_SHELL)
-    L.warn('/ws/shell activo: ejecuta comandos en el telefono. Pon ADMIN_SHELL=0 si no lo necesitas.');
-  dnsServer.bind(DNS_PORT, '0.0.0.0', () => L.info(`DNS :${DNS_PORT}`));
-  server.listen(PORT, '0.0.0.0', () => L.ok(`Portal :${PORT}`));
-})();
+  if (!await hasRoot()) {
+    L.err('No hay root (su). Este portal no puede funcionar sin el.');
+    process.exit(1);
+  }
+
+  const cached = await allow.loadInto();
+  if (cached) L.info(`allowlist: ${cached} CIDR recuperados del cache`);
+  await resolveDomains({ applyRule: false });
+
+  const r = await waitForHotspot();
+  await applyNet(r, { first: true });
+  startWatcher();
+
+  if (cfg.cleanMs > 0) {
+    const t = setInterval(async () => {
+      const list = [...devices.keys()].filter(m => !cfg.freeMacs.has(m));
+      for (const mac of list) await deauthMac(mac);
+      if (list.length) L.info(`limpieza: ${list.length} desautenticados`);
+    }, cfg.cleanMs);
+    if (t.unref) t.unref();
+  }
+
+  if (cfg.snoop && cfg.snoopRefreshMs > 0) {
+    const t = setInterval(() => resolveDomains().catch(() => {}), cfg.snoopRefreshMs);
+    if (t.unref) t.unref();
+  }
+
+  if (cfg.snoopTtlMs > 0) {
+    const t = setInterval(() => {
+      const n = allow.sweep();
+      if (n) L.info(`allowlist: ${n} CIDR caducados`);
+    }, Math.max(60000, Math.floor(cfg.snoopTtlMs / 10)));
+    if (t.unref) t.unref();
+  }
+
+  const st = allow.stats();
+  L.info(`allowlist: ${st.total} CIDR (${st.fixed} fijos, ${st.learned} aprendidos de ${st.max}) | snoop=${cfg.snoop ? 'on' : 'off'}${cfg.snoopForceDns ? ' force-dns' : ''} | widen=${cfg.widen.length}`);
+  if (!st.total) L.warn('allowlist VACIA: nadie podra salir. Revisa ALLOW_RANGES / ALLOW_DOMAINS.');
+  L.info(`panel=${cfg.admin ? 'on' : 'off'} shell=${cfg.adminShell ? 'ON' : 'off'} ipv6=${cfg.blockIpv6 ? 'bloqueado' : 'permitido'} aislamiento=${cfg.isolate ? 'on' : 'off'} openMs=${cfg.openMs}`);
+  if (generatedPass) L.warn(`ADMIN_USERS vacio: usuario "admin" con clave temporal de este arranque: ${generatedPass}`);
+  if (cfg.adminShell) L.warn('/ws/shell activo: ejecuta comandos en el telefono. ADMIN_SHELL=0 para quitarlo.');
+})().catch(e => {
+  L.err(`arranque: ${e.stack || e.message}`);
+  process.exit(1);
+});

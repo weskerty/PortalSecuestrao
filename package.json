@@ -1,17 +1,18 @@
 {
-  "name": "portal",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "portalsecuestrao",
+  "version": "2.0.0",
+  "description": "Portal cautivo con jardin vallado para el anclaje de Android (Termux + root)",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "node tests/run.js && node tests/net.js"
   },
-  "keywords": [],
-  "author": "",
+  "engines": {
+    "node": ">=18"
+  },
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "dns2": "^2.1.0",
     "express": "^5.2.1",
     "ws": "^8.20.0"
   }
