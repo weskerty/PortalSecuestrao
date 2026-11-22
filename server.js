@@ -25,8 +25,21 @@ const TERMUX_SH = '/data/data/com.termux/files/usr/bin/bash';
 
 const COLOR = { info: 36, ok: 32, warn: 33, err: 31 };
 function stamp() { return new Date().toTimeString().slice(0, 8); }
+
+/* El panel tenia un solo buffer de log y las consultas DNS, que son cientos
+ * por minuto, expulsaban todo lo demas: cuando algo fallaba de verdad el aviso
+ * ya no estaba para cuando alguien iba a mirarlo. Los avisos, los errores y el
+ * alta y baja de clientes viven en su propio anillo. */
+const EVT_MAX = 200;
+const evtBuf = [];
+function pushEvt(type, mac, ip, data) {
+  if (evtBuf.length >= EVT_MAX) evtBuf.shift();
+  evtBuf.push({ ts: Date.now(), mac, ip, type, data });
+}
+
 function L(level, msg) {
   const c = COLOR[level] || 36;
+  if (level === 'warn' || level === 'err') pushEvt(level, '', '', msg);
   console.log(`\x1b[${c}m[${stamp()}]\x1b[0m ${msg}`);
 }
 L.info = m => L('info', m);
@@ -84,6 +97,7 @@ let net = { iface: cfg.iface, gw: cfg.gw, upIface: '', upKind: '', source: '' };
 let portalUrl = '';
 
 function pushLog(mac, ip, type, data) {
+  if (type !== 'dns') { pushEvt(type, mac, ip, data); return; }
   if (logBuf.length >= cfg.logMax) logBuf.shift();
   logBuf.push({ ts: Date.now(), mac, ip, type, data });
 }
@@ -342,7 +356,10 @@ app.post('/api/deauth/:mac', adminAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/log', adminAuth, (req, res) => res.json(logBuf.slice(-200)));
+app.get('/api/log', adminAuth, (req, res) => {
+  const out = [...evtBuf, ...logBuf.slice(-200)].sort((a, b) => a.ts - b.ts);
+  res.json(out);
+});
 
 app.get('/api/env', adminAuth, (req, res) => {
   const p = path.join(DIR, '.env');
@@ -407,7 +424,7 @@ app.post('/auth', async (req, res) => {
   const mac = await macs.lookup(ip);
   if (!mac) {
     L.warn(`auth sin MAC ip=${ip}`);
-    return res.json({ ok: false, err: 'MAC no encontrada' });
+    return res.json({ ok: false, err: 'No consigo identificar tu dispositivo, reintenta' });
   }
   await authMac(mac, ip);
   res.json({ ok: true });

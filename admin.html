@@ -582,6 +582,8 @@ async function loadLog() {
     if (l.type === 'dns')    return `<div><span>${t}</span> <b>${esc(l.mac || '?')}</b> &rarr; ${esc(l.data)}</div>`;
     if (l.type === 'auth')   return `<div><span>${t}</span> <b>${esc(l.mac)}</b> <span class="badge ok">AUTH</span> ${esc(l.ip)}</div>`;
     if (l.type === 'deauth') return `<div><span>${t}</span> <b>${esc(l.mac)}</b> <span class="badge warn">DEAUTH</span></div>`;
+    if (l.type === 'warn')   return `<div><span>${t}</span> <span class="badge warn">AVISO</span> ${esc(l.data)}</div>`;
+    if (l.type === 'err')    return `<div><span>${t}</span> <span class="badge warn">ERROR</span> ${esc(l.data)}</div>`;
     return '';
   }).join('');
 }

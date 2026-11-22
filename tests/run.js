@@ -1,6 +1,6 @@
 'use strict';
 
-/* Fixtures tomadas de un Redmi ginkgo con MIUI / Android 13, hotspot activo.
+/* Fixtures tomadas de un Redmi ginkgo con una ROM AOSP custom, hotspot activo.
  * node tests/run.js */
 
 const assert = require('assert');
@@ -8,9 +8,18 @@ const cfg = require('../lib/config');
 const det = require('../lib/detect');
 
 let pass = 0, fail = 0;
+const pending = [];
+
+/* Las pruebas async se recogen y se esperan al final. Con un try/catch
+ * sincrono, una funcion async solo devolvia una promesa: el catch no veia
+ * nunca el fallo y TODA prueba async contaba como superada aunque fallase. */
 function t(name, fn) {
-  try { fn(); pass++; console.log(`  ok   ${name}`); }
-  catch (e) { fail++; console.log(`  FAIL ${name}\n       ${e.message}`); }
+  const ok = () => { pass++; console.log(`  ok   ${name}`); };
+  const ko = e => { fail++; console.log(`  FAIL ${name}\n       ${e.message}`); };
+  let r;
+  try { r = fn(); } catch (e) { return ko(e); }
+  if (r && typeof r.then === 'function') { pending.push(r.then(ok, ko)); return; }
+  ok();
 }
 function group(name) { console.log(`\n${name}`); }
 
@@ -620,5 +629,78 @@ t('apply se niega con una interfaz o un gateway invalidos', async () => {
   await assert.rejects(() => fw.apply([]), /gateway invalido/);
 });
 
-console.log(`\n${pass} ok, ${fail} fallos\n`);
-process.exit(fail ? 1 : 0);
+/* --------------------------------------------------------------- clientes --- */
+
+group('MAC de cliente: la tabla se vuelve a leer');
+
+const { MacTable } = require('../lib/clients');
+const os = require('os');
+const fsx = require('fs');
+const pathx = require('path');
+
+const ARP_HEAD = 'IP address       HW type     Flags       HW address            Mask     Device';
+const CLI_240  = '192.168.112.240  0x1         0x2         4a:ea:9c:27:91:68     *        wlan1';
+const CLI_199  = '192.168.112.199  0x1         0x2         52:e8:77:0d:f3:16     *        wlan1';
+const INCOMPL  = '192.168.112.192  0x1         0x0         00:00:00:00:00:00     *        wlan1';
+
+function arpFile(lines) {
+  const f = pathx.join(os.tmpdir(), 'arp-' + Math.random().toString(36).slice(2));
+  fsx.writeFileSync(f, [ARP_HEAD].concat(lines).concat(['']).join('\n'));
+  return f;
+}
+
+t('parseArp ignora la entrada incompleta, con la MAC a ceros', () => {
+  const m = new MacTable({ arpPath: arpFile([]) });
+  const tbl = m.parseArp([ARP_HEAD, CLI_240, INCOMPL].join('\n'));
+  assert.strictEqual(tbl.size, 1);
+  assert.strictEqual(tbl.get('192.168.112.240'), '4a:ea:9c:27:91:68');
+});
+
+t('parseNeigh lee la salida de ip neigh y descarta las entradas sin lladdr', () => {
+  const m = new MacTable({ arpPath: arpFile([]) });
+  const tbl = m.parseNeigh([
+    '192.168.112.192 dev wlan1 FAILED ',
+    '192.168.112.199 dev wlan1 lladdr 52:e8:77:0d:f3:16 STALE ',
+    'fe80::d354:5f07:bd06:69e9 dev wlan0 lladdr 00:08:22:c8:d3:fb STALE ',
+  ].join('\n'));
+  assert.strictEqual(tbl.size, 1);
+  assert.strictEqual(tbl.get('192.168.112.199'), '52:e8:77:0d:f3:16');
+});
+
+/* El fallo real: inflight se ponia a null DENTRO de la funcion async, que al
+ * leer /proc/net/arp sin await corria entera de forma sincrona, asi que el
+ * null pasaba ANTES de la asignacion y quedaba clavado en la primera promesa.
+ * La tabla no se releia nunca: un movil que se conectaba despues del primer
+ * lookup no tenia MAC y el portal le respondia que algo habia fallado. */
+t('refresh deja inflight limpio aunque no haya pasado por ningun await', async () => {
+  const m = new MacTable({ arpPath: arpFile([CLI_240]) });
+  await m.lookup('192.168.112.240');
+  assert.strictEqual(m.inflight, null, 'inflight quedo clavado: no se releeria la tabla nunca mas');
+});
+
+t('un cliente que aparece DESPUES del primer lookup si resuelve su MAC', async () => {
+  const f = arpFile([CLI_240]);
+  const m = new MacTable({ arpPath: f, minGapMs: 0 });
+  assert.strictEqual(await m.lookup('192.168.112.240'), '4a:ea:9c:27:91:68');
+  assert.strictEqual(await m.lookup('192.168.112.199'), null);
+  fsx.writeFileSync(f, [ARP_HEAD, CLI_240, CLI_199, ''].join('\n'));
+  assert.strictEqual(await m.lookup('192.168.112.199'), '52:e8:77:0d:f3:16');
+});
+
+t('el aprendizaje por DNS no relee el fichero en cada consulta', async () => {
+  const f = arpFile([CLI_240]);
+  const m = new MacTable({ arpPath: f, minGapMs: 10000 });
+  await m.lookup('192.168.112.240');
+  const ts = m.ts;
+  fsx.writeFileSync(f, [ARP_HEAD, CLI_240, CLI_199, ''].join('\n'));
+  await m.refresh();
+  assert.strictEqual(m.ts, ts, 'releyo dentro del hueco minimo');
+  assert.strictEqual(m.map.has('192.168.112.199'), false);
+  await m.refresh({ force: true });
+  assert.strictEqual(m.map.get('192.168.112.199'), '52:e8:77:0d:f3:16');
+});
+
+Promise.all(pending).then(() => {
+  console.log(`\n${pass} ok, ${fail} fallos\n`);
+  process.exit(fail ? 1 : 0);
+});

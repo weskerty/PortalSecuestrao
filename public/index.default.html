@@ -349,12 +349,12 @@ async function authorize(){
       B.className='status ok';
       showPopup();
     }else{
-      throw 0;
+      throw new Error(D.err||'');
     }
 
-  }catch{
+  }catch(E){
     B.className='status err';
-    B.textContent='Perdon, algo fallo 😿';
+    B.textContent=(E&&E.message)?('Perdon, '+E.message+' 😿'):'Perdon, algo fallo 😿';
     A.disabled=false;
   }
 }
