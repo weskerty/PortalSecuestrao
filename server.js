@@ -226,6 +226,23 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
+/* Registro de peticiones de cliente. Cuando un movil no saca la ventana del
+ * portal no hay nada que mirar: hace falta saber que pidio exactamente, con
+ * que Host, y que se le respondio. Se deja fuera lo que no aporta (loopback,
+ * el panel y los recursos de la portada) para no inundar el log. */
+app.use((req, res, next) => {
+  const ip = clientIp(req);
+  if (isLoopback(ip)) return next();
+  if (/^[/](api|ws)[/]/.test(req.path)) return next();
+  if (/[.](css|js|png|jpe?g|gif|svg|ico|woff2?|mp4|webp)$/i.test(req.path)) return next();
+  res.on('finish', () => {
+    const host = String(req.headers.host || '?').slice(0, 60);
+    pushEvt('http', macs.cached(ip) || '', ip,
+      `${req.method} ${host}${req.originalUrl} -> ${res.statusCode}`);
+  });
+  next();
+});
+
 function clientIp(req) {
   /* No hay proxy delante: X-Forwarded-For lo pone el propio cliente y confiar
    * en el permitia inyectar texto arbitrario donde antes se usaba la IP para
